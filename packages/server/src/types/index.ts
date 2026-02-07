@@ -213,6 +213,4 @@ export interface SniperJobRequest {
   desiredDateRanges: DateRange[];
   groupSize: number;
   windowOpensAt: string;
-  email: string;
-  password: string;
 }

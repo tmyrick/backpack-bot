@@ -94,10 +94,8 @@ export async function fetchSniperJobs(): Promise<SniperJob[]> {
 
 export async function fetchSniperJob(
   id: string,
-): Promise<{ job: SniperJob; needsCredentials: boolean }> {
-  return apiFetch<{ job: SniperJob; needsCredentials: boolean }>(
-    `/sniper/${id}`,
-  );
+): Promise<{ job: SniperJob }> {
+  return apiFetch<{ job: SniperJob }>(`/sniper/${id}`);
 }
 
 export async function deleteSniperJob(
@@ -108,13 +106,3 @@ export async function deleteSniperJob(
   });
 }
 
-export async function supplySniperCredentials(
-  id: string,
-  email: string,
-  password: string,
-): Promise<{ updated: boolean }> {
-  return apiFetch<{ updated: boolean }>(`/sniper/${id}/credentials`, {
-    method: "PATCH",
-    body: JSON.stringify({ email, password }),
-  });
-}

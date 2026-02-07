@@ -5,9 +5,7 @@ import {
   getJob,
   cancelJob,
   deleteJob,
-  supplyCredentials,
   subscribeToSniperUpdates,
-  jobNeedsCredentials,
   type SniperJobRequest,
 } from "../services/sniper.js";
 
@@ -42,14 +40,6 @@ sniperRoutes.post("/", async (req: Request, res: Response) => {
         });
         return;
       }
-    }
-
-    if (!body.email || !body.password) {
-      res.status(400).json({
-        error:
-          "Missing credentials: email and password are required for booking automation",
-      });
-      return;
     }
 
     const job = await createJob(body);
@@ -100,10 +90,7 @@ sniperRoutes.get("/:id", (req: Request, res: Response) => {
     res.status(404).json({ error: "Job not found" });
     return;
   }
-  res.json({
-    job,
-    needsCredentials: jobNeedsCredentials(req.params.id),
-  });
+  res.json({ job });
 });
 
 // ---- Cancel a job ----
@@ -117,24 +104,3 @@ sniperRoutes.delete("/:id", async (req: Request, res: Response) => {
   res.json({ deleted: true });
 });
 
-// ---- Re-supply credentials after server restart ----
-
-sniperRoutes.patch(
-  "/:id/credentials",
-  (req: Request, res: Response) => {
-    const { email, password } = req.body as {
-      email: string;
-      password: string;
-    };
-    if (!email || !password) {
-      res.status(400).json({ error: "email and password required" });
-      return;
-    }
-    const ok = supplyCredentials(req.params.id, email, password);
-    if (!ok) {
-      res.status(404).json({ error: "Job not found" });
-      return;
-    }
-    res.json({ updated: true });
-  },
-);

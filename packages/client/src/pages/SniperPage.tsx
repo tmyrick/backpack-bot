@@ -3,7 +3,6 @@ import { useSearchParams } from "react-router-dom";
 import {
   createSniperJob,
   deleteSniperJob,
-  supplySniperCredentials,
   fetchPermits,
 } from "../services/api";
 import { useSniperEvents } from "../hooks/useSniperEvents";
@@ -150,8 +149,6 @@ function SniperForm({
   ]);
   const [groupSize, setGroupSize] = useState(1);
   const [windowOpensAt, setWindowOpensAt] = useState("");
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -291,10 +288,6 @@ function SniperForm({
       setError("Set the window opening time.");
       return;
     }
-    if (!email || !password) {
-      setError("Recreation.gov credentials are required.");
-      return;
-    }
 
     setSubmitting(true);
     try {
@@ -305,13 +298,10 @@ function SniperForm({
         desiredDateRanges: filteredRanges,
         groupSize,
         windowOpensAt: new Date(windowOpensAt).toISOString(),
-        email,
-        password,
       });
       setSuccess(`Sniper job created! ID: ${job.id.slice(0, 8)}...`);
       // Reset form
       setDesiredRanges([{ startDate: "", endDate: "" }]);
-      setPassword("");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create job");
     } finally {
@@ -343,7 +333,7 @@ function SniperForm({
             <option value="">
               {loadingPermits ? "Loading permits..." : "Select a permit..."}
             </option>
-            {permits.map((p) => (
+            {[...permits].sort((a, b) => a.name.localeCompare(b.name)).map((p) => (
               <option key={p.facilityId} value={p.facilityId}>
                 {p.name}
               </option>
@@ -587,38 +577,9 @@ function SniperForm({
         </div>
       </div>
 
-      {/* Credentials */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div>
-          <label className="block text-sm font-medium text-stone-700 mb-1">
-            Recreation.gov Email
-          </label>
-          <input
-            type="email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            placeholder="your-email@example.com"
-            className="w-full px-3 py-2 border border-stone-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
-          />
-        </div>
-        <div>
-          <label className="block text-sm font-medium text-stone-700 mb-1">
-            Recreation.gov Password
-          </label>
-          <input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="your-password"
-            className="w-full px-3 py-2 border border-stone-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
-          />
-        </div>
-      </div>
-
-      <p className="text-xs text-stone-500 bg-amber-50 border border-amber-200 rounded-lg p-3">
-        <strong>Security note:</strong> Credentials are stored only in server
-        memory and are never saved to disk. After a server restart, you will
-        need to re-enter them for pending jobs.
+      <p className="text-xs text-stone-500 bg-stone-50 border border-stone-200 rounded-lg p-3">
+        Recreation.gov credentials are read from server environment variables
+        (RECGOV_EMAIL / RECGOV_PASSWORD).
       </p>
 
       {error && (
@@ -648,7 +609,6 @@ function SniperForm({
 
 function SniperJobCard({ job }: { job: SniperJob }) {
   const [deleting, setDeleting] = useState(false);
-  const [showCredForm, setShowCredForm] = useState(false);
   const [countdown, setCountdown] = useState(
     formatCountdown(job.windowOpensAt),
   );
@@ -783,8 +743,7 @@ function SniperJobCard({ job }: { job: SniperJob }) {
             </button>
           )}
 
-          {!isActive &&
-            job.status !== "in-cart" && (
+          {!isActive && (
               <button
                 onClick={handleDelete}
                 disabled={deleting}
@@ -794,102 +753,9 @@ function SniperJobCard({ job }: { job: SniperJob }) {
               </button>
             )}
 
-          {job.status === "pending" && (
-            <button
-              onClick={() => setShowCredForm(!showCredForm)}
-              className="px-3 py-1.5 text-sm bg-amber-50 text-amber-700 hover:bg-amber-100 rounded-lg transition"
-            >
-              Re-enter Credentials
-            </button>
-          )}
         </div>
-
-        {/* Credential re-entry form */}
-        {showCredForm && (
-          <CredentialForm
-            jobId={job.id}
-            onDone={() => setShowCredForm(false)}
-          />
-        )}
       </div>
     </div>
   );
 }
 
-// ---- Credential re-entry form ----
-
-function CredentialForm({
-  jobId,
-  onDone,
-}: {
-  jobId: string;
-  onDone: () => void;
-}) {
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const handleSubmit = async (e: FormEvent) => {
-    e.preventDefault();
-    if (!email || !password) {
-      setError("Both fields are required.");
-      return;
-    }
-    setSubmitting(true);
-    setError(null);
-    try {
-      await supplySniperCredentials(jobId, email, password);
-      onDone();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to update");
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <form
-      onSubmit={handleSubmit}
-      className="mt-3 p-3 bg-amber-50 border border-amber-200 rounded-lg space-y-2"
-    >
-      <p className="text-xs text-amber-700">
-        Credentials were lost after server restart. Re-enter to activate this
-        job.
-      </p>
-      <div className="grid grid-cols-2 gap-2">
-        <input
-          type="email"
-          placeholder="Email"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          className="px-2 py-1.5 text-sm border border-amber-300 rounded focus:ring-1 focus:ring-amber-500"
-        />
-        <input
-          type="password"
-          placeholder="Password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          className="px-2 py-1.5 text-sm border border-amber-300 rounded focus:ring-1 focus:ring-amber-500"
-        />
-      </div>
-      {error && <p className="text-xs text-red-600">{error}</p>}
-      <div className="flex gap-2">
-        <button
-          type="submit"
-          disabled={submitting}
-          className="px-3 py-1 text-xs bg-amber-600 text-white rounded hover:bg-amber-700 disabled:opacity-50"
-        >
-          {submitting ? "Saving..." : "Save Credentials"}
-        </button>
-        <button
-          type="button"
-          onClick={onDone}
-          className="px-3 py-1 text-xs bg-stone-200 text-stone-600 rounded hover:bg-stone-300"
-        >
-          Cancel
-        </button>
-      </div>
-    </form>
-  );
-}
