@@ -89,3 +89,46 @@ export interface BookingState {
   message: string;
   createdAt: string;
 }
+
+// ---- Sniper Types ----
+
+export type SniperStatus =
+  | "pending"
+  | "pre-warming"
+  | "watching"
+  | "booking"
+  | "in-cart"
+  | "failed"
+  | "cancelled";
+
+export interface DateRange {
+  startDate: string; // YYYY-MM-DD (entry date)
+  endDate: string;   // YYYY-MM-DD (exit date)
+}
+
+export interface SniperJob {
+  id: string;
+  permitId: string;
+  permitName: string;
+  divisionId: string;
+  desiredDateRanges: DateRange[]; // in priority order
+  groupSize: number;
+  windowOpensAt: string;
+  status: SniperStatus;
+  attempts: number;
+  message: string;
+  bookedRange: DateRange | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SniperJobRequest {
+  permitId: string;
+  permitName: string;
+  divisionId: string;
+  desiredDateRanges: DateRange[];
+  groupSize: number;
+  windowOpensAt: string;
+  email: string;
+  password: string;
+}

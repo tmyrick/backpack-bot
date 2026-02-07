@@ -4,6 +4,8 @@ import type {
   PermitAvailability,
   BookingRequest,
   BookingState,
+  SniperJob,
+  SniperJobRequest,
 } from "../types/index.js";
 
 const API_BASE = "/api";
@@ -70,5 +72,49 @@ export async function cancelBooking(
 ): Promise<{ cancelled: boolean }> {
   return apiFetch<{ cancelled: boolean }>(`/booking/${bookingId}`, {
     method: "DELETE",
+  });
+}
+
+// ---- Sniper ----
+
+export async function createSniperJob(
+  request: SniperJobRequest,
+): Promise<SniperJob> {
+  const data = await apiFetch<{ job: SniperJob }>("/sniper", {
+    method: "POST",
+    body: JSON.stringify(request),
+  });
+  return data.job;
+}
+
+export async function fetchSniperJobs(): Promise<SniperJob[]> {
+  const data = await apiFetch<{ jobs: SniperJob[] }>("/sniper");
+  return data.jobs;
+}
+
+export async function fetchSniperJob(
+  id: string,
+): Promise<{ job: SniperJob; needsCredentials: boolean }> {
+  return apiFetch<{ job: SniperJob; needsCredentials: boolean }>(
+    `/sniper/${id}`,
+  );
+}
+
+export async function deleteSniperJob(
+  id: string,
+): Promise<{ deleted: boolean }> {
+  return apiFetch<{ deleted: boolean }>(`/sniper/${id}`, {
+    method: "DELETE",
+  });
+}
+
+export async function supplySniperCredentials(
+  id: string,
+  email: string,
+  password: string,
+): Promise<{ updated: boolean }> {
+  return apiFetch<{ updated: boolean }>(`/sniper/${id}/credentials`, {
+    method: "PATCH",
+    body: JSON.stringify({ email, password }),
   });
 }

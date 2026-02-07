@@ -44,6 +44,36 @@ router.get("/:permitId", async (req, res) => {
 });
 
 /**
+ * GET /api/permits/:permitId/divisions
+ * Returns division names for a permit (proxied from recreation.gov).
+ */
+router.get("/:permitId/divisions", async (req, res) => {
+  const { permitId } = req.params;
+  try {
+    const response = await fetch(
+      `https://www.recreation.gov/api/permits/${permitId}/divisions`,
+      {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+          Accept: "application/json",
+        },
+      },
+    );
+    if (!response.ok) {
+      res.status(response.status).json({ error: `Upstream: ${response.statusText}` });
+      return;
+    }
+    const data = await response.json();
+    res.json(data);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    console.error("[permits] Error fetching divisions:", message);
+    res.status(500).json({ error: message });
+  }
+});
+
+/**
  * GET /api/permits/:permitId/availability?month=YYYY-MM
  * Scrapes recreation.gov for real-time availability data.
  */

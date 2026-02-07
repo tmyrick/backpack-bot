@@ -3,6 +3,7 @@ import { Outlet, Link, useLocation } from "react-router-dom";
 const navItems = [
   { to: "/", label: "Permits" },
   { to: "/booking", label: "Booking" },
+  { to: "/sniper", label: "Sniper" },
 ];
 
 export default function Layout() {
