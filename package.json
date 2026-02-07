@@ -1,0 +1,17 @@
+{
+  "name": "backpack-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Automated wilderness reservation and backpacking permit booking for recreation.gov",
+  "workspaces": [
+    "packages/client",
+    "packages/server"
+  ],
+  "scripts": {
+    "dev": "tsx watch --env-file=.env packages/server/src/index.ts & npx -w packages/client vite; wait",
+    "dev:client": "npm run dev -w packages/client",
+    "dev:server": "npm run dev -w packages/server",
+    "build": "npm run build -w packages/server && npm run build -w packages/client",
+    "lint": "eslint packages/*/src --ext .ts,.tsx"
+  }
+}
