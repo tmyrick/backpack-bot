@@ -64,7 +64,7 @@ function getRecgovCredentials(): { email: string; password: string } {
 // ---- Constants ----
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.resolve(__dirname, "../../../../data");
+const DATA_DIR = process.env.DATA_DIR || path.resolve(__dirname, "../../../../data");
 const JOBS_FILE = path.join(DATA_DIR, "sniper-jobs.json");
 const SCREENSHOTS_DIR = path.join(DATA_DIR, "screenshots");
 

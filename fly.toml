@@ -1,0 +1,32 @@
+# fly.toml app configuration file generated for backpack-bot-autumn-lake-4299 on 2026-02-07T19:33:33-08:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'backpack-bot-autumn-lake-4299'
+primary_region = 'lax'
+
+[build]
+
+[env]
+  DATA_DIR = '/data'
+  NODE_ENV = 'production'
+  PORT = '3001'
+
+[[mounts]]
+  source = 'backpack_data'
+  destination = '/data'
+
+[http_service]
+  internal_port = 3001
+  force_https = true
+  auto_stop_machines = 'off'
+  auto_start_machines = false
+  min_machines_running = 0
+
+[[vm]]
+  size = 'performance-2x'
+  memory = '4gb'
+  cpu_kind = 'performance'
+  cpus = 2
+  memory_mb = 4096

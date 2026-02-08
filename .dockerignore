@@ -1,0 +1,10 @@
+node_modules
+data
+.env
+.git
+.gitignore
+.nvmrc
+*.md
+packages/server/dist
+packages/client/dist
+fly.toml
