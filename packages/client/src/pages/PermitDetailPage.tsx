@@ -18,8 +18,8 @@ export default function PermitDetailPage() {
 
   if (loading) {
     return (
-      <div className="flex items-center gap-3 text-stone-500">
-        <div className="h-5 w-5 border-2 border-stone-300 border-t-emerald-600 rounded-full animate-spin" />
+      <div className="flex items-center gap-3 text-stone-400">
+        <div className="h-5 w-5 border-2 border-stone-600 border-t-emerald-500 rounded-full animate-spin" />
         Loading permit details...
       </div>
     );
@@ -27,10 +27,10 @@ export default function PermitDetailPage() {
 
   if (error) {
     return (
-      <div className="bg-red-50 border border-red-200 rounded-lg p-4 text-red-800">
+      <div className="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-200">
         <p className="font-medium">Error loading permit</p>
         <p className="text-sm mt-1">{error}</p>
-        <Link to="/" className="text-sm text-red-600 underline mt-2 inline-block">
+        <Link to="/" className="text-sm text-red-300 underline mt-2 inline-block">
           Back to permits list
         </Link>
       </div>
@@ -39,9 +39,9 @@ export default function PermitDetailPage() {
 
   if (!permit) {
     return (
-      <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 text-amber-800">
+      <div className="bg-amber-900/30 border border-amber-700 rounded-lg p-4 text-amber-200">
         <p className="font-medium">Permit not found</p>
-        <Link to="/" className="text-sm text-amber-600 underline mt-2 inline-block">
+        <Link to="/" className="text-sm text-amber-300 underline mt-2 inline-block">
           Back to permits list
         </Link>
       </div>
@@ -61,7 +61,7 @@ export default function PermitDetailPage() {
     <div>
       <Link
         to="/"
-        className="text-sm text-stone-400 hover:text-emerald-600 transition mb-4 inline-flex items-center gap-1"
+        className="text-sm text-stone-400 hover:text-emerald-400 transition mb-4 inline-flex items-center gap-1"
       >
         <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
           <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
@@ -69,23 +69,23 @@ export default function PermitDetailPage() {
         Back to permits
       </Link>
 
-      <h1 className="text-3xl font-bold mb-2">{permit.name}</h1>
-      <p className="text-stone-500 mb-6">
+      <h1 className="text-3xl font-bold mb-2 text-stone-100">{permit.name}</h1>
+      <p className="text-stone-400 mb-6">
         {stripHtml(permit.description) || "No description available."}
       </p>
 
       {/* Metadata */}
       <div className="flex flex-wrap gap-3 mb-8">
-        <span className="bg-stone-100 text-stone-600 text-xs px-3 py-1 rounded-full">
+        <span className="bg-stone-700 text-stone-300 text-xs px-3 py-1 rounded-full">
           Facility ID: {permit.facilityId}
         </span>
         {permit.reservable && (
-          <span className="bg-emerald-100 text-emerald-700 text-xs px-3 py-1 rounded-full font-medium">
+          <span className="bg-emerald-900/50 text-emerald-300 text-xs px-3 py-1 rounded-full font-medium">
             Reservable
           </span>
         )}
         {permit.latitude !== 0 && (
-          <span className="bg-stone-100 text-stone-600 text-xs px-3 py-1 rounded-full">
+          <span className="bg-stone-700 text-stone-300 text-xs px-3 py-1 rounded-full">
             {permit.latitude.toFixed(4)}, {permit.longitude.toFixed(4)}
           </span>
         )}
@@ -94,7 +94,7 @@ export default function PermitDetailPage() {
       {/* Links */}
       {permit.links.length > 0 && (
         <div className="mb-8">
-          <h2 className="text-lg font-semibold mb-3">Links</h2>
+          <h2 className="text-lg font-semibold mb-3 text-stone-200">Links</h2>
           <div className="flex flex-wrap gap-2">
             {permit.links.map((link, i) => (
               <a
@@ -102,7 +102,7 @@ export default function PermitDetailPage() {
                 href={link.url}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="text-sm bg-blue-50 text-blue-700 hover:bg-blue-100 px-3 py-1.5 rounded-lg transition"
+                className="text-sm bg-stone-700 text-emerald-300 hover:bg-stone-600 px-3 py-1.5 rounded-lg transition"
               >
                 {link.title || link.url}
               </a>
@@ -113,12 +113,12 @@ export default function PermitDetailPage() {
 
       {/* Entry Points */}
       <div className="mb-8">
-        <h2 className="text-lg font-semibold mb-3">
+        <h2 className="text-lg font-semibold mb-3 text-stone-200">
           Entry Points ({permit.entrances.length})
         </h2>
 
         {permit.entrances.length === 0 ? (
-          <p className="text-stone-400 text-sm italic">
+          <p className="text-stone-500 text-sm italic">
             No entry points found for this facility.
           </p>
         ) : (
@@ -126,19 +126,19 @@ export default function PermitDetailPage() {
             {permit.entrances.map((entrance) => (
               <div
                 key={entrance.id}
-                className="bg-white border border-stone-200 rounded-lg p-4"
+                className="bg-stone-800 border border-stone-700 rounded-lg p-4"
               >
                 <div className="flex items-start justify-between gap-3">
                   <div>
-                    <h3 className="font-medium text-stone-900">
+                    <h3 className="font-medium text-stone-100">
                       {entrance.name}
                     </h3>
                     {entrance.description && (
-                      <p className="text-sm text-stone-500 mt-1">
+                      <p className="text-sm text-stone-400 mt-1">
                         {stripHtml(entrance.description)}
                       </p>
                     )}
-                    <div className="flex gap-3 mt-2 text-xs text-stone-400">
+                    <div className="flex gap-3 mt-2 text-xs text-stone-500">
                       <span>ID: {entrance.id}</span>
                       {entrance.district && (
                         <span>District: {entrance.district}</span>
@@ -150,15 +150,15 @@ export default function PermitDetailPage() {
 
                 {/* Zones */}
                 {entrance.zones.length > 0 && (
-                  <div className="mt-3 pt-3 border-t border-stone-100">
-                    <p className="text-xs font-medium text-stone-400 mb-2">
+                  <div className="mt-3 pt-3 border-t border-stone-700">
+                    <p className="text-xs font-medium text-stone-500 mb-2">
                       Zones ({entrance.zones.length})
                     </p>
                     <div className="flex flex-wrap gap-1.5">
                       {entrance.zones.map((zone) => (
                         <span
                           key={zone.id}
-                          className="text-xs bg-stone-100 text-stone-600 px-2 py-1 rounded"
+                          className="text-xs bg-stone-700 text-stone-300 px-2 py-1 rounded"
                           title={zone.description || zone.name}
                         >
                           {zone.name}
@@ -174,13 +174,13 @@ export default function PermitDetailPage() {
       </div>
 
       {/* Availability section */}
-      <div className="bg-white border border-stone-200 rounded-lg p-6">
+      <div className="bg-stone-800 border border-stone-700 rounded-lg p-6">
         <div className="flex items-center justify-between mb-4">
-          <h2 className="text-lg font-semibold">Availability</h2>
+          <h2 className="text-lg font-semibold text-stone-200">Availability</h2>
           {!showAvailability && (
             <button
               onClick={() => setShowAvailability(true)}
-              className="px-4 py-2 bg-emerald-600 text-white text-sm font-medium rounded-lg hover:bg-emerald-700 transition"
+              className="px-4 py-2 bg-emerald-600 text-white text-sm font-medium rounded-lg hover:bg-emerald-500 transition"
             >
               Check Availability
             </button>
@@ -199,16 +199,16 @@ export default function PermitDetailPage() {
             onSelectDate={handleSelectDate}
           />
         ) : showAvailability && availability.loading ? (
-          <div className="flex items-center gap-3 text-stone-500 py-4">
-            <div className="h-5 w-5 border-2 border-stone-300 border-t-emerald-600 rounded-full animate-spin" />
+          <div className="flex items-center gap-3 text-stone-400 py-4">
+            <div className="h-5 w-5 border-2 border-stone-600 border-t-emerald-500 rounded-full animate-spin" />
             Scraping availability from recreation.gov... This may take a moment.
           </div>
         ) : showAvailability && availability.error ? (
-          <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-red-800 text-sm">
+          <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-200 text-sm">
             {availability.error}
           </div>
         ) : !showAvailability ? (
-          <p className="text-stone-500 text-sm">
+          <p className="text-stone-400 text-sm">
             Click "Check Availability" to scrape real-time availability from
             recreation.gov. Click on an available date to set up automated
             booking.

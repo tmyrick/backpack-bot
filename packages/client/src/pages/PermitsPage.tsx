@@ -11,24 +11,24 @@ export default function PermitsPage() {
 
   return (
     <div>
-      <h1 className="text-3xl font-bold mb-2">Oregon Wilderness Permits</h1>
-      <p className="text-stone-500 mb-8">
+      <h1 className="text-3xl font-bold mb-2 text-stone-100">Oregon Wilderness Permits</h1>
+      <p className="text-stone-400 mb-8">
         Browse available wilderness and backpacking permits in Oregon. Select a
         permit to view entry points, zones, and availability.
       </p>
 
       {loading && (
-        <div className="flex items-center gap-3 text-stone-500">
-          <div className="h-5 w-5 border-2 border-stone-300 border-t-emerald-600 rounded-full animate-spin" />
+        <div className="flex items-center gap-3 text-stone-400">
+          <div className="h-5 w-5 border-2 border-stone-600 border-t-emerald-500 rounded-full animate-spin" />
           Loading permits from RIDB...
         </div>
       )}
 
       {error && (
-        <div className="bg-red-50 border border-red-200 rounded-lg p-4 text-red-800">
+        <div className="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-200">
           <p className="font-medium">Error loading permits</p>
           <p className="text-sm mt-1">{error}</p>
-          <p className="text-sm mt-2 text-red-600">
+          <p className="text-sm mt-2 text-red-300">
             Make sure the server is running and RIDB_API_KEY is set in your .env
             file.
           </p>
@@ -36,7 +36,7 @@ export default function PermitsPage() {
       )}
 
       {!loading && !error && permits.length === 0 && (
-        <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 text-amber-800">
+        <div className="bg-amber-900/30 border border-amber-700 rounded-lg p-4 text-amber-200">
           <p className="font-medium">No permits found</p>
           <p className="text-sm mt-1">
             No Oregon permit facilities were returned from the RIDB API. Make
@@ -50,17 +50,17 @@ export default function PermitsPage() {
           <Link
             key={permit.facilityId}
             to={`/permits/${permit.facilityId}`}
-            className="block bg-white border border-stone-200 rounded-lg p-5 hover:border-emerald-400 hover:shadow-md transition group"
+            className="block bg-stone-800 border border-stone-700 rounded-lg p-5 hover:border-emerald-500 hover:shadow-lg transition group"
           >
             <div className="flex items-start justify-between gap-4">
               <div className="flex-1 min-w-0">
-                <h2 className="text-lg font-semibold text-stone-900 group-hover:text-emerald-700 transition">
+                <h2 className="text-lg font-semibold text-stone-100 group-hover:text-emerald-400 transition">
                   {permit.name}
                 </h2>
-                <p className="text-sm text-stone-500 mt-1 line-clamp-2">
+                <p className="text-sm text-stone-400 mt-1 line-clamp-2">
                   {stripHtml(permit.description) || "No description available."}
                 </p>
-                <div className="flex gap-4 mt-3 text-xs text-stone-400">
+                <div className="flex gap-4 mt-3 text-xs text-stone-500">
                   <span>Facility ID: {permit.facilityId}</span>
                   {permit.entranceCount > 0 && (
                     <span>
@@ -69,13 +69,13 @@ export default function PermitsPage() {
                     </span>
                   )}
                   {permit.reservable && (
-                    <span className="text-emerald-600 font-medium">
+                    <span className="text-emerald-400 font-medium">
                       Reservable
                     </span>
                   )}
                 </div>
               </div>
-              <div className="text-stone-300 group-hover:text-emerald-500 transition mt-1">
+              <div className="text-stone-500 group-hover:text-emerald-400 transition mt-1">
                 <svg
                   className="h-5 w-5"
                   fill="none"

@@ -69,7 +69,7 @@ const JOBS_FILE = path.join(DATA_DIR, "sniper-jobs.json");
 const SCREENSHOTS_DIR = path.join(DATA_DIR, "screenshots");
 
 const PRE_WARM_LEAD_MS = 2 * 60 * 1000; // 2 minutes before window
-const POLL_INTERVAL_MS = 1_500; // 1.5 seconds
+const POLL_INTERVAL_MS = 1_000; // 1 second — faster detection when window opens
 const MAX_WATCH_DURATION_MS = 5 * 60 * 1000; // 5 minutes of watching
 const RECGOV_API = "https://www.recreation.gov/api/permits";
 
@@ -342,7 +342,7 @@ async function runSniperJob(job: SniperJob): Promise<void> {
     const permitUrl = `https://www.recreation.gov/permits/${job.permitId}/registration/detailed-availability?date=${firstRange.startDate}&type=overnight`;
     jobLog(job, "Navigating to permit page:", permitUrl);
     await page.goto(permitUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await page.waitForTimeout(3000); // let JS hydrate
+    await page.waitForTimeout(1500); // let JS hydrate
     jobLog(job, "Permit page loaded. URL:", page.url());
     await saveScreenshot(page, job, "permit-page-prewarm");
 
@@ -730,7 +730,7 @@ async function setGroupSize(page: Page, job: SniperJob): Promise<void> {
 
     // Step 5: Wait for the availability table to render
     jobLog(job, "Step 5: Waiting for availability table to load...");
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(1500);
 
     try {
       await page.locator('[data-testid="availability-cell"]').first().waitFor({ timeout: 10000 });
@@ -760,7 +760,7 @@ async function attemptBrowserBooking(
     const url = `https://www.recreation.gov/permits/${job.permitId}/registration/detailed-availability?date=${targetRange.startDate}&type=overnight`;
     jobLog(job, "Navigating to:", url);
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await page.waitForTimeout(5000); // let JS hydrate
+    await page.waitForTimeout(3000); // let JS hydrate
 
     // Must set group size before availability shows
     await setGroupSize(page, job);
@@ -800,7 +800,7 @@ async function attemptBrowserBooking(
           await btn.first().click({ timeout: 5000 });
           clickCount++;
           jobLog(job, `  Clicked! (${clickCount} total)`);
-          await page.waitForTimeout(500);
+          await page.waitForTimeout(300);
         } else {
           // Fallback: try broader selector
           const fallback = page.locator(
@@ -812,7 +812,7 @@ async function attemptBrowserBooking(
             await fallback.first().click({ timeout: 5000 });
             clickCount++;
             jobLog(job, `  Fallback clicked! (${clickCount} total)`);
-            await page.waitForTimeout(500);
+            await page.waitForTimeout(300);
           } else {
             jobLog(job, `  No available button found for ${nightDate}`);
           }
@@ -831,7 +831,7 @@ async function attemptBrowserBooking(
       return "failed";
     }
 
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(1000);
     await saveScreenshot(page, job, "after-cell-click");
 
     // Click "Book Now"
@@ -875,7 +875,7 @@ async function attemptBrowserBooking(
     }
 
     // Wait for the Order Details page to load
-    await page.waitForTimeout(5000);
+    await page.waitForTimeout(2500);
     await saveScreenshot(page, job, "after-book-click");
 
     // Fill order details (address, terms checkbox) and proceed to cart
@@ -939,7 +939,7 @@ async function fillOrderDetails(page: Page, job: SniperJob): Promise<boolean> {
     // Fill country (select)
     jobLog(job, `Setting country to ${country}...`);
     await page.locator("select#country").selectOption(country);
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(300);
 
     // Fill address
     jobLog(job, `Setting address to "${address}"...`);
@@ -951,14 +951,14 @@ async function fillOrderDetails(page: Page, job: SniperJob): Promise<boolean> {
 
     // Fill state (select) -- wait for state dropdown to populate after country selection
     jobLog(job, `Setting state to ${state}...`);
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(300);
     await page.locator("select#state").selectOption(state);
 
     // Fill zip
     jobLog(job, `Setting zip to "${zip}"...`);
     await page.locator("input#zip_code").fill(zip);
 
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(300);
     await saveScreenshot(page, job, "order-details-filled");
 
     // Check the "Need to Know" terms checkbox
@@ -973,7 +973,7 @@ async function fillOrderDetails(page: Page, job: SniperJob): Promise<boolean> {
       jobLog(job, "Terms checkbox already checked.");
     }
 
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(300);
 
     // Click "Proceed to Cart"
     jobLog(job, 'Clicking "Proceed to Cart"...');
@@ -982,7 +982,7 @@ async function fillOrderDetails(page: Page, job: SniperJob): Promise<boolean> {
     await cartBtn.click();
     jobLog(job, "Clicked Proceed to Cart!");
 
-    await page.waitForTimeout(5000);
+    await page.waitForTimeout(3000);
     await saveScreenshot(page, job, "after-proceed-to-cart");
 
     return true;
@@ -1006,7 +1006,7 @@ async function signIn(
     waitUntil: "domcontentloaded",
     timeout: 60000,
   });
-  await page.waitForTimeout(3000); // let the login form render
+  await page.waitForTimeout(1500); // let the login form render
 
   // Exact selectors from recreation.gov DOM:
   //   Email:    input#email (type="email")
@@ -1031,7 +1031,7 @@ async function signIn(
       (url) => !url.pathname.includes("log-in"),
       { timeout: 15000 },
     );
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(1500);
   } catch {
     if (page.url().includes("log-in")) {
       throw new Error("Login failed. Check your recreation.gov credentials.");

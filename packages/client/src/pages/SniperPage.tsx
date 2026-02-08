@@ -16,38 +16,38 @@ const statusConfig: Record<
 > = {
   pending: {
     label: "Pending",
-    color: "text-stone-700",
-    bg: "bg-stone-100",
+    color: "text-stone-300",
+    bg: "bg-stone-700",
   },
   "pre-warming": {
     label: "Pre-Warming",
-    color: "text-blue-700",
-    bg: "bg-blue-50",
+    color: "text-blue-300",
+    bg: "bg-blue-900/50",
   },
   watching: {
     label: "Watching",
-    color: "text-amber-700",
-    bg: "bg-amber-50",
+    color: "text-amber-300",
+    bg: "bg-amber-900/50",
   },
   booking: {
     label: "Booking",
-    color: "text-purple-700",
-    bg: "bg-purple-50",
+    color: "text-purple-300",
+    bg: "bg-purple-900/50",
   },
   "in-cart": {
     label: "In Cart!",
-    color: "text-emerald-700",
-    bg: "bg-emerald-50",
+    color: "text-emerald-300",
+    bg: "bg-emerald-900/50",
   },
   failed: {
     label: "Failed",
-    color: "text-red-700",
-    bg: "bg-red-50",
+    color: "text-red-300",
+    bg: "bg-red-900/50",
   },
   cancelled: {
     label: "Cancelled",
-    color: "text-stone-500",
-    bg: "bg-stone-50",
+    color: "text-stone-400",
+    bg: "bg-stone-700",
   },
 };
 
@@ -77,11 +77,11 @@ export default function SniperPage() {
   return (
     <div className="space-y-8">
       <div>
-        <h1 className="text-3xl font-bold text-stone-800">Permit Sniper</h1>
-        <p className="mt-2 text-stone-600">
+        <h1 className="text-3xl font-bold text-stone-100">Permit Sniper</h1>
+        <p className="mt-2 text-stone-400">
           Configure a sniper job to automatically book a permit the instant
           availability opens. The bot will sign in 2 minutes early, then poll
-          for availability every 1.5 seconds. The moment a slot opens, it books
+          for availability every 1 second. The moment a slot opens, it books
           your highest-priority available date.
         </p>
       </div>
@@ -94,12 +94,12 @@ export default function SniperPage() {
 
       <div>
         <div className="flex items-center justify-between mb-4">
-          <h2 className="text-xl font-semibold text-stone-800">Active Jobs</h2>
+          <h2 className="text-xl font-semibold text-stone-200">Active Jobs</h2>
           <span
             className={`text-xs px-2 py-1 rounded-full ${
               connected
-                ? "bg-emerald-100 text-emerald-700"
-                : "bg-red-100 text-red-700"
+                ? "bg-emerald-900/50 text-emerald-300"
+                : "bg-red-900/50 text-red-300"
             }`}
           >
             {connected ? "Live" : "Disconnected"}
@@ -107,8 +107,8 @@ export default function SniperPage() {
         </div>
 
         {jobs.length === 0 ? (
-          <div className="text-center py-12 bg-stone-50 rounded-lg border border-stone-200">
-            <p className="text-stone-500">
+          <div className="text-center py-12 bg-stone-800 rounded-lg border border-stone-700">
+            <p className="text-stone-400">
               No sniper jobs yet. Create one above.
             </p>
           </div>
@@ -312,22 +312,22 @@ function SniperForm({
   return (
     <form
       onSubmit={handleSubmit}
-      className="bg-white rounded-xl shadow-sm border border-stone-200 p-6 space-y-6"
+      className="bg-stone-800 rounded-xl shadow-sm border border-stone-700 p-6 space-y-6"
     >
-      <h2 className="text-xl font-semibold text-stone-800">
+      <h2 className="text-xl font-semibold text-stone-200">
         Configure Sniper Job
       </h2>
 
       {/* Permit selection */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div>
-          <label className="block text-sm font-medium text-stone-700 mb-1">
+          <label className="block text-sm font-medium text-stone-300 mb-1">
             Permit
           </label>
           <select
             value={permitId}
             onChange={(e) => handlePermitChange(e.target.value)}
-            className="w-full px-3 py-2 border border-stone-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
+            className="w-full px-3 py-2 border border-stone-600 rounded-lg bg-stone-900 text-stone-100 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
             disabled={loadingPermits}
           >
             <option value="">
@@ -345,13 +345,13 @@ function SniperForm({
         </div>
 
         <div>
-          <label className="block text-sm font-medium text-stone-700 mb-1">
+          <label className="block text-sm font-medium text-stone-300 mb-1">
             Division / Entrance
           </label>
           <select
             value={divisionId}
             onChange={(e) => setDivisionId(e.target.value)}
-            className="w-full px-3 py-2 border border-stone-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
+            className="w-full px-3 py-2 border border-stone-600 rounded-lg bg-stone-900 text-stone-100 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
             disabled={!permitId || loadingDivisions}
           >
             <option value="">
@@ -378,7 +378,7 @@ function SniperForm({
               placeholder="Division ID"
               value={divisionId}
               onChange={(e) => setDivisionId(e.target.value)}
-              className="mt-1 w-full px-3 py-2 border border-stone-300 rounded-lg text-sm focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
+              className="mt-1 w-full px-3 py-2 border border-stone-600 rounded-lg text-sm bg-stone-900 text-stone-100 placeholder-stone-500 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
             />
           )}
         </div>
@@ -386,7 +386,7 @@ function SniperForm({
 
       {/* Desired date ranges */}
       <div>
-        <label className="block text-sm font-medium text-stone-700 mb-2">
+        <label className="block text-sm font-medium text-stone-300 mb-2">
           Desired Date Ranges (in priority order)
         </label>
         <p className="text-xs text-stone-500 mb-2">
@@ -399,9 +399,9 @@ function SniperForm({
             return (
               <div
                 key={i}
-                className="flex items-center gap-2 p-3 bg-stone-50 rounded-lg border border-stone-200"
+                className="flex items-center gap-2 p-3 bg-stone-900 rounded-lg border border-stone-700"
               >
-                <span className="w-6 text-center text-xs text-stone-400 font-mono shrink-0">
+                <span className="w-6 text-center text-xs text-stone-500 font-mono shrink-0">
                   #{i + 1}
                 </span>
                 <div className="flex-1 grid grid-cols-2 gap-2">
@@ -415,7 +415,7 @@ function SniperForm({
                       onChange={(e) =>
                         updateRange(i, "startDate", e.target.value)
                       }
-                      className="w-full px-3 py-2 border border-stone-300 rounded-lg text-sm focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
+                      className="w-full px-3 py-2 border border-stone-600 rounded-lg text-sm bg-stone-800 text-stone-100 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
                     />
                   </div>
                   <div>
@@ -428,19 +428,19 @@ function SniperForm({
                       onChange={(e) =>
                         updateRange(i, "endDate", e.target.value)
                       }
-                      className="w-full px-3 py-2 border border-stone-300 rounded-lg text-sm focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
+                      className="w-full px-3 py-2 border border-stone-600 rounded-lg text-sm bg-stone-800 text-stone-100 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
                     />
                   </div>
                 </div>
                 {nights !== null && (
-                  <span className="text-xs text-emerald-600 font-medium shrink-0 w-16 text-center">
+                  <span className="text-xs text-emerald-400 font-medium shrink-0 w-16 text-center">
                     {nights} night{nights !== 1 ? "s" : ""}
                   </span>
                 )}
                 {range.startDate &&
                   range.endDate &&
                   range.endDate <= range.startDate && (
-                    <span className="text-xs text-red-500 shrink-0">
+                    <span className="text-xs text-red-400 shrink-0">
                       Invalid
                     </span>
                   )}
@@ -449,7 +449,7 @@ function SniperForm({
                     type="button"
                     onClick={() => moveRange(i, -1)}
                     disabled={i === 0}
-                    className="p-0.5 text-stone-400 hover:text-stone-600 disabled:opacity-30"
+                    className="p-0.5 text-stone-500 hover:text-stone-300 disabled:opacity-30"
                     title="Move up"
                   >
                     <svg
@@ -470,7 +470,7 @@ function SniperForm({
                     type="button"
                     onClick={() => moveRange(i, 1)}
                     disabled={i === desiredRanges.length - 1}
-                    className="p-0.5 text-stone-400 hover:text-stone-600 disabled:opacity-30"
+                    className="p-0.5 text-stone-500 hover:text-stone-300 disabled:opacity-30"
                     title="Move down"
                   >
                     <svg
@@ -492,7 +492,7 @@ function SniperForm({
                   <button
                     type="button"
                     onClick={() => removeRange(i)}
-                    className="p-1 text-red-400 hover:text-red-600 shrink-0"
+                    className="p-1 text-red-400 hover:text-red-300 shrink-0"
                     title="Remove"
                   >
                     <svg
@@ -517,7 +517,7 @@ function SniperForm({
         <button
           type="button"
           onClick={addRange}
-          className="mt-2 text-sm text-emerald-600 hover:text-emerald-700 font-medium"
+          className="mt-2 text-sm text-emerald-400 hover:text-emerald-300 font-medium"
         >
           + Add another date range
         </button>
@@ -526,7 +526,7 @@ function SniperForm({
       {/* Group size + Window opens at */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div>
-          <label className="block text-sm font-medium text-stone-700 mb-1">
+          <label className="block text-sm font-medium text-stone-300 mb-1">
             Group Size
           </label>
           <input
@@ -535,19 +535,19 @@ function SniperForm({
             max={30}
             value={groupSize}
             onChange={(e) => setGroupSize(Number(e.target.value))}
-            className="w-full px-3 py-2 border border-stone-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
+            className="w-full px-3 py-2 border border-stone-600 rounded-lg bg-stone-900 text-stone-100 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
           />
         </div>
 
         <div>
-          <label className="block text-sm font-medium text-stone-700 mb-1">
+          <label className="block text-sm font-medium text-stone-300 mb-1">
             Window Opens At
           </label>
           <input
             type="datetime-local"
             value={windowOpensAt}
             onChange={(e) => setWindowOpensAt(e.target.value)}
-            className="w-full px-3 py-2 border border-stone-300 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
+            className="w-full px-3 py-2 border border-stone-600 rounded-lg bg-stone-900 text-stone-100 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
           />
           <p className="mt-1 text-xs text-stone-500">
             When permits become available to reserve (your local time).
@@ -568,7 +568,7 @@ function SniperForm({
                 key={preset.label}
                 type="button"
                 onClick={() => setWindowOpensAt(preset.value)}
-                className="text-xs px-2 py-1 bg-stone-100 hover:bg-stone-200 rounded text-stone-600"
+                className="text-xs px-2 py-1 bg-stone-700 hover:bg-stone-600 rounded text-stone-300"
               >
                 {preset.label}
               </button>
@@ -577,19 +577,19 @@ function SniperForm({
         </div>
       </div>
 
-      <p className="text-xs text-stone-500 bg-stone-50 border border-stone-200 rounded-lg p-3">
+      <p className="text-xs text-stone-500 bg-stone-900 border border-stone-700 rounded-lg p-3">
         Recreation.gov credentials are read from server environment variables
         (RECGOV_EMAIL / RECGOV_PASSWORD).
       </p>
 
       {error && (
-        <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700">
+        <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-sm text-red-200">
           {error}
         </div>
       )}
 
       {success && (
-        <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3 text-sm text-emerald-700">
+        <div className="bg-emerald-900/30 border border-emerald-700 rounded-lg p-3 text-sm text-emerald-300">
           {success}
         </div>
       )}
@@ -597,7 +597,7 @@ function SniperForm({
       <button
         type="submit"
         disabled={submitting}
-        className="w-full py-3 bg-emerald-700 hover:bg-emerald-800 text-white font-medium rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed"
+        className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-medium rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed"
       >
         {submitting ? "Creating..." : "Create Sniper Job"}
       </button>
@@ -649,17 +649,17 @@ function SniperJobCard({ job }: { job: SniperJob }) {
     <div
       className={`rounded-xl border shadow-sm overflow-hidden ${
         job.status === "in-cart"
-          ? "border-emerald-300 bg-emerald-50/50"
+          ? "border-emerald-600 bg-emerald-900/30"
           : job.status === "failed"
-            ? "border-red-200 bg-red-50/30"
-            : "border-stone-200 bg-white"
+            ? "border-red-700 bg-red-900/20"
+            : "border-stone-700 bg-stone-800"
       }`}
     >
       <div className="p-5">
         {/* Header row */}
         <div className="flex items-start justify-between mb-3">
           <div>
-            <h3 className="font-semibold text-stone-800">
+            <h3 className="font-semibold text-stone-100">
               {job.permitName || `Permit ${job.permitId}`}
             </h3>
             <p className="text-xs text-stone-500 mt-0.5">
@@ -674,7 +674,7 @@ function SniperJobCard({ job }: { job: SniperJob }) {
         </div>
 
         {/* Status message */}
-        <p className="text-sm text-stone-600 mb-3">{job.message}</p>
+        <p className="text-sm text-stone-400 mb-3">{job.message}</p>
 
         {/* Info grid */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
@@ -691,8 +691,8 @@ function SniperJobCard({ job }: { job: SniperJob }) {
                     key={`${r.startDate}-${r.endDate}`}
                     className={`text-xs px-1.5 py-0.5 rounded ${
                       isBooked
-                        ? "bg-emerald-200 text-emerald-800 font-medium"
-                        : "bg-stone-100 text-stone-600"
+                        ? "bg-emerald-800 text-emerald-200 font-medium"
+                        : "bg-stone-700 text-stone-300"
                     }`}
                   >
                     {i + 1}. {r.startDate} to {r.endDate}
@@ -704,28 +704,28 @@ function SniperJobCard({ job }: { job: SniperJob }) {
 
           <div>
             <span className="text-stone-500 text-xs block">Group Size</span>
-            <span className="font-medium">{job.groupSize}</span>
+            <span className="font-medium text-stone-200">{job.groupSize}</span>
           </div>
 
           <div>
             <span className="text-stone-500 text-xs block">Window Opens</span>
-            <span className="font-medium">
+            <span className="font-medium text-stone-200">
               {new Date(job.windowOpensAt).toLocaleString()}
             </span>
             {isActive && (
-              <span className="text-xs text-amber-600 block">{countdown}</span>
+              <span className="text-xs text-amber-400 block">{countdown}</span>
             )}
           </div>
 
           <div>
             <span className="text-stone-500 text-xs block">Polls</span>
-            <span className="font-medium">{job.attempts}</span>
+            <span className="font-medium text-stone-200">{job.attempts}</span>
           </div>
         </div>
 
         {/* Booked range */}
         {job.bookedRange && (
-          <div className="mt-3 bg-emerald-100 text-emerald-800 text-sm font-medium rounded-lg p-3">
+          <div className="mt-3 bg-emerald-900/50 text-emerald-200 text-sm font-medium rounded-lg p-3">
             Booked: {job.bookedRange.startDate} to {job.bookedRange.endDate}{" "}
             &mdash; Complete your purchase on recreation.gov!
           </div>
@@ -737,7 +737,7 @@ function SniperJobCard({ job }: { job: SniperJob }) {
             <button
               onClick={handleDelete}
               disabled={deleting}
-              className="px-3 py-1.5 text-sm bg-red-50 text-red-700 hover:bg-red-100 rounded-lg transition disabled:opacity-50"
+              className="px-3 py-1.5 text-sm bg-red-900/50 text-red-300 hover:bg-red-800/50 rounded-lg transition disabled:opacity-50"
             >
               {deleting ? "Cancelling..." : "Cancel"}
             </button>
@@ -747,7 +747,7 @@ function SniperJobCard({ job }: { job: SniperJob }) {
               <button
                 onClick={handleDelete}
                 disabled={deleting}
-                className="px-3 py-1.5 text-sm bg-stone-100 text-stone-600 hover:bg-stone-200 rounded-lg transition disabled:opacity-50"
+                className="px-3 py-1.5 text-sm bg-stone-700 text-stone-300 hover:bg-stone-600 rounded-lg transition disabled:opacity-50"
               >
                 {deleting ? "Removing..." : "Remove"}
               </button>

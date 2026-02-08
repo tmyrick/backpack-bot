@@ -10,8 +10,8 @@ export default function Layout() {
   const location = useLocation();
 
   return (
-    <div className="min-h-screen flex flex-col">
-      <header className="bg-emerald-800 text-white shadow-lg">
+    <div className="min-h-screen flex flex-col bg-stone-900">
+      <header className="bg-stone-800 border-b border-stone-700 text-white shadow-lg">
         <div className="max-w-6xl mx-auto px-4 py-4 flex items-center justify-between">
           <Link to="/" className="flex items-center gap-2 hover:opacity-90 transition">
             <span className="text-2xl font-bold tracking-tight">Backpack Bot</span>
@@ -28,8 +28,8 @@ export default function Layout() {
                   to={item.to}
                   className={`px-4 py-2 rounded-lg text-sm font-medium transition ${
                     isActive
-                      ? "bg-emerald-700 text-white"
-                      : "text-emerald-100 hover:bg-emerald-700/50"
+                      ? "bg-emerald-600 text-white"
+                      : "text-stone-300 hover:bg-stone-700 hover:text-white"
                   }`}
                 >
                   {item.label}
@@ -39,10 +39,10 @@ export default function Layout() {
           </nav>
         </div>
       </header>
-      <main className="flex-1 max-w-6xl mx-auto px-4 py-8 w-full">
+      <main className="flex-1 max-w-6xl mx-auto px-4 py-8 w-full text-stone-200">
         <Outlet />
       </main>
-      <footer className="bg-stone-100 border-t border-stone-200 py-4 text-center text-sm text-stone-500">
+      <footer className="bg-stone-800 border-t border-stone-700 py-4 text-center text-sm text-stone-400">
         Backpack Bot &mdash; Data Source: Recreation.gov
       </footer>
     </div>
