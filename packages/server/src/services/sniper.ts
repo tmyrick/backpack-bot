@@ -321,36 +321,43 @@ async function runSniperJob(job: SniperJob): Promise<void> {
     });
     await saveJobs();
 
-    const browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    await logStepTiming(job, "launch browser", async () => {
+      const b = await chromium.launch({ headless: true });
+      const context = await b.newContext({
+        userAgent:
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      });
+      const p = await context.newPage();
+      browsers.set(job.id, { browser: b, page: p });
+      return { browser: b, page: p };
     });
-    const page = await context.newPage();
-    browsers.set(job.id, { browser, page });
+    const { browser, page } = browsers.get(job.id)!;
 
     if (signal.aborted) return;
 
-    // Sign in
     jobLog(job, "Starting sign-in...");
-    await signIn(page, creds.email, creds.password);
+    await logStepTiming(job, "sign-in", () =>
+      signIn(page, creds.email, creds.password),
+    );
     jobLog(job, "Sign-in complete. Current URL:", page.url());
     if (signal.aborted) return;
 
-    // Navigate to the permit page
     const firstRange = job.desiredDateRanges[0];
     const permitUrl = `https://www.recreation.gov/permits/${job.permitId}/registration/detailed-availability?date=${firstRange.startDate}&type=overnight`;
     jobLog(job, "Navigating to permit page:", permitUrl);
-    await page.goto(permitUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await page.waitForTimeout(1500); // let JS hydrate
+    await logStepTiming(job, "goto permit page + hydrate", async () => {
+      await page.goto(permitUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await page.waitForTimeout(1500); // let JS hydrate
+      await saveScreenshot(page, job, "permit-page-prewarm");
+    });
     jobLog(job, "Permit page loaded. URL:", page.url());
-    await saveScreenshot(page, job, "permit-page-prewarm");
 
     if (signal.aborted) return;
 
-    // Set group size - recreation.gov uses a custom dropdown for this
     jobLog(job, `Setting group size to ${job.groupSize}...`);
-    await setGroupSize(page, job);
+    await logStepTiming(job, "set group size (pre-warm)", () =>
+      setGroupSize(page, job),
+    );
 
     // Wait until window opens
     const windowTime = new Date(job.windowOpensAt).getTime();
@@ -592,6 +599,25 @@ function jobLog(job: SniperJob, ...args: unknown[]): void {
   console.log(`[sniper:${job.id.slice(0, 8)}]`, ...args);
 }
 
+/** Run an async step and log how long it took. */
+async function logStepTiming<T>(
+  job: SniperJob,
+  stepName: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const start = performance.now();
+  try {
+    const result = await fn();
+    const ms = Math.round(performance.now() - start);
+    jobLog(job, `⏱ ${stepName}: ${ms} ms`);
+    return result;
+  } catch (err) {
+    const ms = Math.round(performance.now() - start);
+    jobLog(job, `⏱ ${stepName}: ${ms} ms (failed)`);
+    throw err;
+  }
+}
+
 async function saveScreenshot(
   page: Page,
   job: SniperJob,
@@ -756,18 +782,19 @@ async function attemptBrowserBooking(
   targetRange: DateRange,
 ): Promise<"booked" | "failed"> {
   try {
-    // Navigate to the availability page for the start date of the range
     const url = `https://www.recreation.gov/permits/${job.permitId}/registration/detailed-availability?date=${targetRange.startDate}&type=overnight`;
     jobLog(job, "Navigating to:", url);
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await page.waitForTimeout(3000); // let JS hydrate
+    await logStepTiming(job, "goto booking page + hydrate", async () => {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await page.waitForTimeout(3000); // let JS hydrate
+    });
 
-    // Must set group size before availability shows
-    await setGroupSize(page, job);
+    await logStepTiming(job, "set group size (booking)", () =>
+      setGroupSize(page, job),
+    );
 
     await debugPageState(page, job, "booking-page-loaded");
 
-    // Get all the individual dates we need to book (each night)
     const nightDates = expandRange(targetRange);
     jobLog(job, "Night dates to book:", nightDates);
 
@@ -834,52 +861,59 @@ async function attemptBrowserBooking(
     await page.waitForTimeout(1000);
     await saveScreenshot(page, job, "after-cell-click");
 
-    // Click "Book Now"
+    const clickDatesMs = await logStepTiming(job, "click date cells", async () => {
+      // Already done above; this times the next block which is "Book Now" + wait
+      return clickCount;
+    });
+    void clickDatesMs;
+
     jobLog(job, "Looking for Book Now button...");
     let bookClicked = false;
-    try {
-      const bookBtn = page.locator('button:has-text("Book Now")');
-      const bookCount = await bookBtn.count();
-      jobLog(job, `Found ${bookCount} "Book Now" button(s)`);
-      if (bookCount > 0) {
-        await bookBtn.first().click({ timeout: 5000 });
-        jobLog(job, "Clicked Book Now!");
-        bookClicked = true;
+    await logStepTiming(job, "click Book Now + wait for order details", async () => {
+      try {
+        const bookBtn = page.locator('button:has-text("Book Now")');
+        const bookCount = await bookBtn.count();
+        jobLog(job, `Found ${bookCount} "Book Now" button(s)`);
+        if (bookCount > 0) {
+          await bookBtn.first().click({ timeout: 5000 });
+          jobLog(job, "Clicked Book Now!");
+          bookClicked = true;
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        jobLog(job, `Book Now error: ${msg}`);
       }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      jobLog(job, `Book Now error: ${msg}`);
-    }
 
-    // Fallback button selectors
-    if (!bookClicked) {
-      for (const label of ["Add to Cart", "Reserve", "Continue", "Next"]) {
-        try {
-          const btn = page.locator(`button:has-text("${label}")`);
-          if ((await btn.count()) > 0) {
-            jobLog(job, `Clicking fallback: "${label}"`);
-            await btn.first().click({ timeout: 3000 });
-            bookClicked = true;
-            break;
+      if (!bookClicked) {
+        for (const label of ["Add to Cart", "Reserve", "Continue", "Next"]) {
+          try {
+            const btn = page.locator(`button:has-text("${label}")`);
+            if ((await btn.count()) > 0) {
+              jobLog(job, `Clicking fallback: "${label}"`);
+              await btn.first().click({ timeout: 3000 });
+              bookClicked = true;
+              break;
+            }
+          } catch {
+            continue;
           }
-        } catch {
-          continue;
         }
       }
-    }
 
-    if (!bookClicked) {
-      jobLog(job, "No booking button found");
-      await saveScreenshot(page, job, "no-book-button");
-      return "failed";
-    }
+      if (!bookClicked) {
+        jobLog(job, "No booking button found");
+        await saveScreenshot(page, job, "no-book-button");
+        throw new Error("No booking button found");
+      }
 
-    // Wait for the Order Details page to load
-    await page.waitForTimeout(2500);
-    await saveScreenshot(page, job, "after-book-click");
+      await page.waitForTimeout(2500);
+      await saveScreenshot(page, job, "after-book-click");
+    });
 
-    // Fill order details (address, terms checkbox) and proceed to cart
-    const orderSuccess = await fillOrderDetails(page, job);
+    let orderSuccess = false;
+    await logStepTiming(job, "fill order details + proceed to cart", async () => {
+      orderSuccess = await fillOrderDetails(page, job);
+    });
     if (orderSuccess) {
       jobLog(job, "Order details filled and proceeded to cart!");
       return "booked";
