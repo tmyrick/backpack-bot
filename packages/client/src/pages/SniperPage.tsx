@@ -1,12 +1,15 @@
-import { useState, useEffect, useCallback, type FormEvent } from "react";
+import { useState, useEffect, useCallback, useMemo, type FormEvent } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
   createSniperJob,
   deleteSniperJob,
   fetchPermits,
+  fetchCampgrounds,
+  fetchCampsites,
 } from "../services/api";
 import { useSniperEvents } from "../hooks/useSniperEvents";
-import type { SniperJob, SniperStatus, PermitSummary, DateRange } from "../types/index";
+import SearchableSelect from "../components/SearchableSelect";
+import type { SniperJob, SniperStatus, BookingType, PermitSummary, CampgroundSummary, CampsiteSummary, DateRange } from "../types/index";
 
 // ---- Status styling ----
 
@@ -77,12 +80,12 @@ export default function SniperPage() {
   return (
     <div className="space-y-8">
       <div>
-        <h1 className="text-3xl font-bold text-stone-100">Permit Sniper</h1>
+        <h1 className="text-3xl font-bold text-stone-100">Sniper</h1>
         <p className="mt-2 text-stone-400">
-          Configure a sniper job to automatically book a permit the instant
-          availability opens. The bot will sign in 2 minutes early, then poll
-          for availability every 1 second. The moment a slot opens, it books
-          your highest-priority available date.
+          Configure a sniper job to automatically book a permit or campsite the
+          instant availability opens. The bot will sign in 2 minutes early, then
+          poll for availability every 1 second. The moment a slot opens, it
+          books your highest-priority available date.
         </p>
       </div>
 
@@ -132,6 +135,9 @@ export default function SniperPage() {
 
 // ---- Configuration Form ----
 
+const selectClasses = "w-full px-3 py-2 border border-stone-600 rounded-lg bg-stone-900 text-stone-100 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500";
+const inputClasses = selectClasses;
+
 function SniperForm({
   defaultPermitId,
   defaultPermitName,
@@ -141,9 +147,30 @@ function SniperForm({
   defaultPermitName: string;
   defaultDivisionId: string;
 }) {
+  // ---- Top-level selectors ----
+  const [state, setState] = useState("OR");
+  const [bookingType, setBookingType] = useState<BookingType>("permit");
+
+  // ---- Permit fields ----
   const [permitId, setPermitId] = useState(defaultPermitId);
   const [permitName, setPermitName] = useState(defaultPermitName);
   const [divisionId, setDivisionId] = useState(defaultDivisionId);
+  const [permits, setPermits] = useState<PermitSummary[]>([]);
+  const [loadingPermits, setLoadingPermits] = useState(false);
+  const [divisions, setDivisions] = useState<{ id: string; name: string }[]>([]);
+  const [loadingDivisions, setLoadingDivisions] = useState(false);
+
+  // ---- Campsite fields ----
+  const [campgroundId, setCampgroundId] = useState("");
+  const [campgroundName, setCampgroundName] = useState("");
+  const [campgroundIsPermit, setCampgroundIsPermit] = useState(false);
+  const [campsiteId, setCampsiteId] = useState("");
+  const [campgrounds, setCampgrounds] = useState<CampgroundSummary[]>([]);
+  const [loadingCampgrounds, setLoadingCampgrounds] = useState(false);
+  const [campsitesList, setCampsitesList] = useState<CampsiteSummary[]>([]);
+  const [loadingCampsites, setLoadingCampsites] = useState(false);
+
+  // ---- Common fields ----
   const [desiredRanges, setDesiredRanges] = useState<DateRange[]>([
     { startDate: "", endDate: "" },
   ]);
@@ -152,23 +179,34 @@ function SniperForm({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
-  const [permits, setPermits] = useState<PermitSummary[]>([]);
-  const [loadingPermits, setLoadingPermits] = useState(false);
-  const [divisions, setDivisions] = useState<
-    { id: string; name: string }[]
-  >([]);
-  const [loadingDivisions, setLoadingDivisions] = useState(false);
 
-  // Load permits list for the dropdown
+  // ---- Load permits when state changes ----
   useEffect(() => {
+    if (bookingType !== "permit") return;
     setLoadingPermits(true);
-    fetchPermits()
+    setPermitId("");
+    setPermitName("");
+    setDivisionId("");
+    fetchPermits(state)
       .then((p) => setPermits(p))
-      .catch(() => {})
+      .catch(() => setPermits([]))
       .finally(() => setLoadingPermits(false));
-  }, []);
+  }, [state, bookingType]);
 
-  // Fetch divisions when permitId changes (proxied through our API)
+  // ---- Load campgrounds when state changes ----
+  useEffect(() => {
+    if (bookingType !== "campsite") return;
+    setLoadingCampgrounds(true);
+    setCampgroundId("");
+    setCampgroundName("");
+    setCampsiteId("");
+    fetchCampgrounds(state)
+      .then((c) => setCampgrounds(c))
+      .catch(() => setCampgrounds([]))
+      .finally(() => setLoadingCampgrounds(false));
+  }, [state, bookingType]);
+
+  // ---- Load divisions for selected permit ----
   const loadDivisions = useCallback(async (pid: string) => {
     if (!pid) {
       setDivisions([]);
@@ -214,7 +252,54 @@ function SniperForm({
     }
   }, [permitId, loadDivisions]);
 
-  // Handle permit selection
+  // ---- Load campsites for selected campground ----
+  useEffect(() => {
+    if (!campgroundId) {
+      setCampsitesList([]);
+      return;
+    }
+    setLoadingCampsites(true);
+    fetchCampsites(campgroundId)
+      .then((cs) => setCampsitesList(cs))
+      .catch(() => setCampsitesList([]))
+      .finally(() => setLoadingCampsites(false));
+  }, [campgroundId]);
+
+  // ---- Memoized option lists for SearchableSelect ----
+  const permitOptions = useMemo(
+    () =>
+      [...permits]
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map((p) => ({ value: p.facilityId, label: p.name })),
+    [permits],
+  );
+
+  const divisionOptions = useMemo(
+    () => divisions.map((d) => ({ value: d.id, label: d.name })),
+    [divisions],
+  );
+
+  const campgroundOptions = useMemo(
+    () =>
+      [...campgrounds]
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map((c) => ({
+          value: c.facilityId,
+          label: c.isPermitFacility ? `${c.name} (permit)` : c.name,
+        })),
+    [campgrounds],
+  );
+
+  const campsiteOptions = useMemo(
+    () =>
+      campsitesList.map((cs) => ({
+        value: cs.campsiteId,
+        label: cs.campsiteName + (cs.loop ? ` (${cs.loop})` : ""),
+      })),
+    [campsitesList],
+  );
+
+  // ---- Handlers ----
   const handlePermitChange = (fid: string) => {
     setPermitId(fid);
     const match = permits.find((p) => p.facilityId === fid);
@@ -222,7 +307,15 @@ function SniperForm({
     setDivisionId("");
   };
 
-  // Date range list management
+  const handleCampgroundChange = (fid: string) => {
+    setCampgroundId(fid);
+    const match = campgrounds.find((c) => c.facilityId === fid);
+    setCampgroundName(match?.name || "");
+    setCampgroundIsPermit(match?.isPermitFacility || false);
+    setCampsiteId("");
+  };
+
+  // Date range management
   const addRange = () =>
     setDesiredRanges((r) => [...r, { startDate: "", endDate: "" }]);
   const removeRange = (index: number) =>
@@ -245,7 +338,6 @@ function SniperForm({
     });
   };
 
-  // Helper: compute number of nights for a range
   const getNights = (range: DateRange): number | null => {
     if (!range.startDate || !range.endDate) return null;
     const start = new Date(range.startDate + "T00:00:00");
@@ -276,13 +368,11 @@ function SniperForm({
         return;
       }
     }
-    if (!permitId) {
-      setError("Select a permit.");
-      return;
-    }
-    if (!divisionId) {
-      setError("Select a division/entrance.");
-      return;
+    if (bookingType === "permit") {
+      if (!permitId) { setError("Select a permit."); return; }
+      if (!divisionId) { setError("Select a division/entrance."); return; }
+    } else {
+      if (!campgroundId) { setError("Select a campground."); return; }
     }
     if (!windowOpensAt) {
       setError("Set the window opening time.");
@@ -292,15 +382,15 @@ function SniperForm({
     setSubmitting(true);
     try {
       const job = await createSniperJob({
-        permitId,
-        permitName,
-        divisionId,
+        bookingType,
+        ...(bookingType === "permit"
+          ? { permitId, permitName, divisionId }
+          : { campgroundId, campgroundName, campgroundIsPermit, campsiteId: campsiteId || undefined }),
         desiredDateRanges: filteredRanges,
         groupSize,
         windowOpensAt: new Date(windowOpensAt).toISOString(),
       });
       setSuccess(`Sniper job created! ID: ${job.id.slice(0, 8)}...`);
-      // Reset form
       setDesiredRanges([{ startDate: "", endDate: "" }]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create job");
@@ -318,71 +408,130 @@ function SniperForm({
         Configure Sniper Job
       </h2>
 
-      {/* Permit selection */}
+      {/* State + Booking type */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div>
           <label className="block text-sm font-medium text-stone-300 mb-1">
-            Permit
+            State
           </label>
           <select
-            value={permitId}
-            onChange={(e) => handlePermitChange(e.target.value)}
-            className="w-full px-3 py-2 border border-stone-600 rounded-lg bg-stone-900 text-stone-100 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
-            disabled={loadingPermits}
+            value={state}
+            onChange={(e) => setState(e.target.value)}
+            className={selectClasses}
           >
-            <option value="">
-              {loadingPermits ? "Loading permits..." : "Select a permit..."}
-            </option>
-            {[...permits].sort((a, b) => a.name.localeCompare(b.name)).map((p) => (
-              <option key={p.facilityId} value={p.facilityId}>
-                {p.name}
-              </option>
-            ))}
+            <option value="OR">Oregon</option>
+            <option value="WA">Washington</option>
           </select>
-          {permitId && (
-            <p className="mt-1 text-xs text-stone-500">ID: {permitId}</p>
-          )}
         </div>
 
         <div>
           <label className="block text-sm font-medium text-stone-300 mb-1">
-            Division / Entrance
+            Booking Type
           </label>
-          <select
-            value={divisionId}
-            onChange={(e) => setDivisionId(e.target.value)}
-            className="w-full px-3 py-2 border border-stone-600 rounded-lg bg-stone-900 text-stone-100 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
-            disabled={!permitId || loadingDivisions}
-          >
-            <option value="">
-              {loadingDivisions
-                ? "Loading..."
-                : !permitId
-                  ? "Select a permit first"
-                  : "Select a division..."}
-            </option>
-            {divisions.map((d) => (
-              <option key={d.id} value={d.id}>
-                {d.name}
-              </option>
+          <div className="flex rounded-lg overflow-hidden border border-stone-600">
+            {(["permit", "campsite"] as BookingType[]).map((t) => (
+              <button
+                key={t}
+                type="button"
+                onClick={() => setBookingType(t)}
+                className={`flex-1 px-4 py-2 text-sm font-medium transition ${
+                  bookingType === t
+                    ? "bg-emerald-600 text-white"
+                    : "bg-stone-900 text-stone-400 hover:bg-stone-700 hover:text-stone-200"
+                }`}
+              >
+                {t === "permit" ? "Permit" : "Campsite"}
+              </button>
             ))}
-          </select>
-          {!permitId && divisions.length === 0 && (
-            <p className="mt-1 text-xs text-stone-500">
-              Or enter a division ID manually:
-            </p>
-          )}
-          {permitId && divisions.length === 0 && !loadingDivisions && (
-            <input
-              type="text"
-              placeholder="Division ID"
-              value={divisionId}
-              onChange={(e) => setDivisionId(e.target.value)}
-              className="mt-1 w-full px-3 py-2 border border-stone-600 rounded-lg text-sm bg-stone-900 text-stone-100 placeholder-stone-500 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
-            />
-          )}
+          </div>
         </div>
       </div>
+
+      {/* Permit selection */}
+      {bookingType === "permit" && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label className="block text-sm font-medium text-stone-300 mb-1">
+              Permit
+            </label>
+            <SearchableSelect
+              options={permitOptions}
+              value={permitId}
+              onChange={handlePermitChange}
+              placeholder="Select a permit..."
+              loading={loadingPermits}
+              loadingText="Loading permits..."
+            />
+            {permitId && (
+              <p className="mt-1 text-xs text-stone-500">ID: {permitId}</p>
+            )}
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-stone-300 mb-1">
+              Division / Entrance
+            </label>
+            <SearchableSelect
+              options={divisionOptions}
+              value={divisionId}
+              onChange={setDivisionId}
+              placeholder={!permitId ? "Select a permit first" : "Select a division..."}
+              disabled={!permitId}
+              loading={loadingDivisions}
+              loadingText="Loading..."
+            />
+            {permitId && divisions.length === 0 && !loadingDivisions && (
+              <input
+                type="text"
+                placeholder="Division ID"
+                value={divisionId}
+                onChange={(e) => setDivisionId(e.target.value)}
+                className={`mt-1 ${inputClasses} text-sm placeholder-stone-500`}
+              />
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Campsite selection */}
+      {bookingType === "campsite" && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label className="block text-sm font-medium text-stone-300 mb-1">
+              Campground
+            </label>
+            <SearchableSelect
+              options={campgroundOptions}
+              value={campgroundId}
+              onChange={handleCampgroundChange}
+              placeholder="Select a campground..."
+              loading={loadingCampgrounds}
+              loadingText="Loading campgrounds..."
+            />
+            {campgroundId && (
+              <p className="mt-1 text-xs text-stone-500">ID: {campgroundId}</p>
+            )}
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-stone-300 mb-1">
+              Campsite (optional)
+            </label>
+            <SearchableSelect
+              options={campsiteOptions}
+              value={campsiteId}
+              onChange={setCampsiteId}
+              placeholder={!campgroundId ? "Select a campground first" : "Any available campsite"}
+              disabled={!campgroundId}
+              loading={loadingCampsites}
+              loadingText="Loading..."
+            />
+            <p className="mt-1 text-xs text-stone-500">
+              Leave empty to book any available site at this campground.
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* Desired date ranges */}
       <div>
@@ -390,8 +539,10 @@ function SniperForm({
           Desired Date Ranges (in priority order)
         </label>
         <p className="text-xs text-stone-500 mb-2">
-          Each range is a trip: entry date to exit date. First range is highest
-          priority. If #1 isn't fully available, the bot tries #2, etc.
+          {bookingType === "permit"
+            ? "Each range is a trip: entry date to exit date. First range is highest priority."
+            : "Each range is a stay: check-in to check-out. First range is highest priority."}
+          {" "}If #1 isn't fully available, the bot tries #2, etc.
         </p>
         <div className="space-y-3">
           {desiredRanges.map((range, i) => {
@@ -407,7 +558,7 @@ function SniperForm({
                 <div className="flex-1 grid grid-cols-2 gap-2">
                   <div>
                     <label className="text-xs text-stone-500 block mb-0.5">
-                      Entry date
+                      {bookingType === "permit" ? "Entry date" : "Check-in"}
                     </label>
                     <input
                       type="date"
@@ -420,7 +571,7 @@ function SniperForm({
                   </div>
                   <div>
                     <label className="text-xs text-stone-500 block mb-0.5">
-                      Exit date
+                      {bookingType === "permit" ? "Exit date" : "Check-out"}
                     </label>
                     <input
                       type="date"
@@ -535,7 +686,7 @@ function SniperForm({
             max={30}
             value={groupSize}
             onChange={(e) => setGroupSize(Number(e.target.value))}
-            className="w-full px-3 py-2 border border-stone-600 rounded-lg bg-stone-900 text-stone-100 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
+            className={inputClasses}
           />
         </div>
 
@@ -547,22 +698,15 @@ function SniperForm({
             type="datetime-local"
             value={windowOpensAt}
             onChange={(e) => setWindowOpensAt(e.target.value)}
-            className="w-full px-3 py-2 border border-stone-600 rounded-lg bg-stone-900 text-stone-100 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500"
+            className={inputClasses}
           />
           <p className="mt-1 text-xs text-stone-500">
-            When permits become available to reserve (your local time).
+            When reservations become available (your local time).
           </p>
-          {/* Presets */}
           <div className="flex gap-2 mt-2 flex-wrap">
             {[
-              {
-                label: "Apr 1, 7 AM PDT",
-                value: "2026-04-01T07:00",
-              },
-              {
-                label: "Apr 1, 10 AM EDT",
-                value: "2026-04-01T10:00",
-              },
+              { label: "Apr 1, 7 AM PDT", value: "2026-04-01T07:00" },
+              { label: "Apr 1, 10 AM EDT", value: "2026-04-01T10:00" },
             ].map((preset) => (
               <button
                 key={preset.label}
@@ -660,10 +804,18 @@ function SniperJobCard({ job }: { job: SniperJob }) {
         <div className="flex items-start justify-between mb-3">
           <div>
             <h3 className="font-semibold text-stone-100">
-              {job.permitName || `Permit ${job.permitId}`}
+              {job.bookingType === "campsite"
+                ? (job.campgroundName || `Campground ${job.campgroundId}`)
+                : (job.permitName || `Permit ${job.permitId}`)}
             </h3>
             <p className="text-xs text-stone-500 mt-0.5">
-              Job {job.id.slice(0, 8)} &middot; Division {job.divisionId}
+              Job {job.id.slice(0, 8)} &middot;{" "}
+              {job.bookingType === "campsite"
+                ? (job.campsiteId ? `Site ${job.campsiteId}` : "Any site")
+                : `Division ${job.divisionId}`}
+              <span className="ml-1.5 px-1.5 py-0.5 rounded bg-stone-700 text-stone-400">
+                {job.bookingType === "campsite" ? "Campsite" : "Permit"}
+              </span>
             </p>
           </div>
           <span
@@ -726,8 +878,9 @@ function SniperJobCard({ job }: { job: SniperJob }) {
         {/* Booked range */}
         {job.bookedRange && (
           <div className="mt-3 bg-emerald-900/50 text-emerald-200 text-sm font-medium rounded-lg p-3">
-            Booked: {job.bookedRange.startDate} to {job.bookedRange.endDate}{" "}
-            &mdash; Complete your purchase on recreation.gov!
+            Booked: {job.bookedRange.startDate} to {job.bookedRange.endDate}
+            {job.bookedCampsiteId ? ` (site ${job.bookedCampsiteId})` : ""}
+            {" "}&mdash; Complete your purchase on recreation.gov!
           </div>
         )}
 

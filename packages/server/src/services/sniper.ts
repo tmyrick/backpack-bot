@@ -1,53 +1,13 @@
-import { chromium, type Browser, type Page } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
+import type { SniperJob, SniperJobRequest, DateRange } from "../types/index.js";
 
-// ---- Types ----
+export type { SniperJob, SniperJobRequest, DateRange };
 
-export interface DateRange {
-  startDate: string; // YYYY-MM-DD (entry date)
-  endDate: string;   // YYYY-MM-DD (exit date)
-}
-
-export type SniperStatus =
-  | "pending"
-  | "pre-warming"
-  | "watching"
-  | "booking"
-  | "in-cart"
-  | "failed"
-  | "cancelled";
-
-export interface SniperJob {
-  id: string;
-  permitId: string;
-  permitName: string;
-  divisionId: string;
-  desiredDateRanges: DateRange[]; // in priority order
-  groupSize: number;
-  windowOpensAt: string; // ISO timestamp
-  status: SniperStatus;
-  attempts: number;
-  message: string;
-  bookedRange: DateRange | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
-/** What the client sends to create a job */
-export interface SniperJobRequest {
-  permitId: string;
-  permitName: string;
-  divisionId: string;
-  desiredDateRanges: DateRange[];
-  groupSize: number;
-  windowOpensAt: string;
-}
-
-/** The serialized form saved to disk (no credentials) */
-type SniperJobOnDisk = Omit<SniperJob, never>; // same shape, just no creds
+type SniperJobOnDisk = Omit<SniperJob, never>;
 
 /** Read recreation.gov credentials from environment variables */
 function getRecgovCredentials(): { email: string; password: string } {
@@ -72,6 +32,52 @@ const PRE_WARM_LEAD_MS = 2 * 60 * 1000; // 2 minutes before window
 const POLL_INTERVAL_MS = 1_000; // 1 second — faster detection when window opens
 const MAX_WATCH_DURATION_MS = 5 * 60 * 1000; // 5 minutes of watching
 const RECGOV_API = "https://www.recreation.gov/api/permits";
+
+const WINDOWS_CHROME_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+/**
+ * Launch a browser + context with stealth settings to avoid bot detection.
+ * Uses the system Chrome install (channel: "chrome") instead of bundled Chromium,
+ * hides navigator.webdriver, and sets realistic viewport/locale/timezone.
+ */
+async function launchStealthBrowser(): Promise<{ browser: Browser; context: BrowserContext; page: Page }> {
+  const browser = await chromium.launch({
+    headless: true,
+    channel: "chrome",
+    args: [
+      "--disable-blink-features=AutomationControlled",
+      "--disable-features=IsolateOrigins,site-per-process",
+      "--no-sandbox",
+    ],
+  });
+
+  const context = await browser.newContext({
+    userAgent: WINDOWS_CHROME_UA,
+    viewport: { width: 1920, height: 1080 },
+    locale: "en-US",
+    timezoneId: "America/Los_Angeles",
+    permissions: ["geolocation"],
+  });
+
+  // Remove navigator.webdriver flag before any page loads
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    // Mimic real Chrome's plugins array (empty in headless, but length > 0 in real)
+    Object.defineProperty(navigator, "plugins", {
+      get: () => [1, 2, 3, 4, 5],
+    });
+    // Mimic real Chrome's languages
+    Object.defineProperty(navigator, "languages", {
+      get: () => ["en-US", "en"],
+    });
+    // Pass Chrome-specific checks
+    (window as any).chrome = { runtime: {}, loadTimes: () => ({}), csi: () => ({}) };
+  });
+
+  const page = await context.newPage();
+  return { browser, context, page };
+}
 
 // ---- In-memory state ----
 
@@ -143,9 +149,15 @@ export async function createJob(req: SniperJobRequest): Promise<SniperJob> {
 
   const job: SniperJob = {
     id,
-    permitId: req.permitId,
-    permitName: req.permitName,
-    divisionId: req.divisionId,
+    bookingType: req.bookingType || "permit",
+    permitId: req.permitId || "",
+    permitName: req.permitName || "",
+    divisionId: req.divisionId || "",
+    campgroundId: req.campgroundId || "",
+    campgroundName: req.campgroundName || "",
+    campgroundIsPermit: req.campgroundIsPermit || false,
+    campsiteId: req.campsiteId || "",
+    bookedCampsiteId: "",
     desiredDateRanges: req.desiredDateRanges,
     groupSize: req.groupSize,
     windowOpensAt: req.windowOpensAt,
@@ -216,6 +228,13 @@ export async function loadAndScheduleJobs(): Promise<void> {
   let scheduledCount = 0;
 
   for (const dj of diskJobs) {
+    // Backward-compat: old jobs without bookingType default to "permit"
+    if (!dj.bookingType) dj.bookingType = "permit";
+    if (!dj.campgroundId) dj.campgroundId = "";
+    if (!dj.campgroundName) dj.campgroundName = "";
+    if (dj.campgroundIsPermit === undefined) dj.campgroundIsPermit = false;
+    if (!dj.campsiteId) dj.campsiteId = "";
+    if (!dj.bookedCampsiteId) dj.bookedCampsiteId = "";
     jobs.set(dj.id, dj);
 
     // Only re-schedule pending jobs whose window hasn't passed
@@ -297,6 +316,16 @@ function scheduleJob(job: SniperJob): void {
 // ---- Main sniper loop ----
 
 async function runSniperJob(job: SniperJob): Promise<void> {
+  const bookingType = job.bookingType || "permit";
+  if (bookingType === "campsite") {
+    return runCampsiteSniperJob(job);
+  }
+  return runPermitSniperJob(job);
+}
+
+// ---- Permit sniper flow (original) ----
+
+async function runPermitSniperJob(job: SniperJob): Promise<void> {
   let creds: { email: string; password: string };
   try {
     creds = getRecgovCredentials();
@@ -322,16 +351,10 @@ async function runSniperJob(job: SniperJob): Promise<void> {
     await saveJobs();
 
     await logStepTiming(job, "launch browser", async () => {
-      const b = await chromium.launch({ headless: true });
-      const context = await b.newContext({
-        userAgent:
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      });
-      const p = await context.newPage();
+      const { browser: b, page: p } = await launchStealthBrowser();
       browsers.set(job.id, { browser: b, page: p });
-      return { browser: b, page: p };
     });
-    const { browser, page } = browsers.get(job.id)!;
+    const { page } = browsers.get(job.id)!;
 
     if (signal.aborted) return;
 
@@ -346,9 +369,7 @@ async function runSniperJob(job: SniperJob): Promise<void> {
     const permitUrl = `https://www.recreation.gov/permits/${job.permitId}/registration/detailed-availability?date=${firstRange.startDate}&type=overnight`;
     jobLog(job, "Navigating to permit page:", permitUrl);
     await logStepTiming(job, "goto permit page + hydrate", async () => {
-      await page.goto(permitUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-      await page.waitForTimeout(1500); // let JS hydrate
-      await saveScreenshot(page, job, "permit-page-prewarm");
+      await safeGoto(page, job, permitUrl, "permit-page-prewarm");
     });
     jobLog(job, "Permit page loaded. URL:", page.url());
 
@@ -447,7 +468,6 @@ async function runSniperJob(job: SniperJob): Promise<void> {
     for (const fallbackRange of remainingRanges) {
       if (signal.aborted) return;
 
-      // Re-check availability for this specific range
       const available = await checkAvailability(
         job.permitId,
         job.divisionId,
@@ -488,7 +508,315 @@ async function runSniperJob(job: SniperJob): Promise<void> {
   } finally {
     abortControllers.delete(job.id);
 
-    // Close browser unless permit is in cart
+    if (job.status !== "in-cart") {
+      const b = browsers.get(job.id);
+      if (b) {
+        try {
+          await b.browser.close();
+        } catch {
+          /* ignore */
+        }
+        browsers.delete(job.id);
+      }
+    }
+  }
+}
+
+// ---- Campsite sniper flow ----
+
+async function runCampsiteSniperJob(job: SniperJob): Promise<void> {
+  let creds: { email: string; password: string };
+  try {
+    creds = getRecgovCredentials();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    updateJob(job, { status: "failed", message: msg });
+    return;
+  }
+
+  const ac = new AbortController();
+  abortControllers.set(job.id, ac);
+  const { signal } = ac;
+
+  try {
+    // ---- Phase 1: Pre-warm ----
+    updateJob(job, {
+      status: "pre-warming",
+      message: "Launching browser and signing in...",
+    });
+    await saveJobs();
+
+    await logStepTiming(job, "launch browser", async () => {
+      const { browser: b, page: p } = await launchStealthBrowser();
+      browsers.set(job.id, { browser: b, page: p });
+    });
+    const { page } = browsers.get(job.id)!;
+
+    if (signal.aborted) return;
+
+    jobLog(job, "Starting sign-in...");
+    await logStepTiming(job, "sign-in", () =>
+      signIn(page, creds.email, creds.password),
+    );
+    jobLog(job, "Sign-in complete. Current URL:", page.url());
+    if (signal.aborted) return;
+
+    // Navigate to the right page based on facility type
+    const firstRange = job.desiredDateRanges[0];
+    let campUrl = job.campgroundIsPermit
+      ? `https://www.recreation.gov/permits/${job.campgroundId}/registration/detailed-availability?date=${firstRange.startDate}&type=overnight`
+      : `https://www.recreation.gov/camping/campgrounds/${job.campgroundId}/availability`;
+    jobLog(job, "Navigating to:", campUrl);
+
+    let navResult = await logStepTiming(job, "goto facility page + hydrate", async () => {
+      return await safeGoto(page, job, campUrl, "campground-page-prewarm");
+    });
+
+    // If we got a 404 on the campground URL, this is likely a permit-type facility
+    if (navResult?.is404 && !job.campgroundIsPermit) {
+      jobLog(job, "Campground URL returned 404. Falling back to permit URL...");
+      job.campgroundIsPermit = true;
+      campUrl = `https://www.recreation.gov/permits/${job.campgroundId}/registration/detailed-availability?date=${firstRange.startDate}&type=overnight`;
+      jobLog(job, "Navigating to permit URL:", campUrl);
+      navResult = await logStepTiming(job, "goto permit page (fallback) + hydrate", async () => {
+        return await safeGoto(page, job, campUrl, "permit-page-fallback");
+      });
+      await saveJobs();
+    }
+
+    if (job.campgroundIsPermit) {
+      jobLog(job, `Setting group size to ${job.groupSize}...`);
+      await logStepTiming(job, "set group size (pre-warm)", () =>
+        setGroupSize(page, job),
+      );
+    }
+
+    if (signal.aborted) return;
+
+    // Wait until window opens
+    const windowTime = new Date(job.windowOpensAt).getTime();
+    const waitMs = windowTime - Date.now();
+    if (waitMs > 0) {
+      updateJob(job, {
+        message: `Pre-warmed. Waiting ${Math.round(waitMs / 1000)}s for window to open...`,
+      });
+      await sleep(waitMs, signal);
+    }
+
+    if (signal.aborted) return;
+
+    // ---- Phase 2: Watch (poll campsite availability API) ----
+    updateJob(job, {
+      status: "watching",
+      message: "Window open! Polling campsite availability...",
+    });
+    await saveJobs();
+
+    const watchDeadline = Date.now() + MAX_WATCH_DURATION_MS;
+
+    if (job.campgroundIsPermit) {
+      // ---- Permit-type facility: use permit availability API ----
+      let foundRange: DateRange | null = null;
+
+      while (!signal.aborted && Date.now() < watchDeadline) {
+        job.attempts++;
+        try {
+          // For permit facilities, divisionId may be empty -- pass campgroundId as permitId
+          // and use empty divisionId to check overall facility availability
+          foundRange = await checkPermitFacilityAvailability(
+            job.campgroundId,
+            job.desiredDateRanges,
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : "unknown error";
+          updateJob(job, {
+            message: `Poll #${job.attempts}: API error (${msg}). Retrying...`,
+          });
+        }
+
+        if (foundRange) {
+          updateJob(job, {
+            message: `Availability detected for ${foundRange.startDate} - ${foundRange.endDate}! Attempting to book...`,
+          });
+          break;
+        }
+
+        updateJob(job, {
+          message: `Poll #${job.attempts}: No availability yet. Next check in ${POLL_INTERVAL_MS / 1000}s...`,
+        });
+        await sleep(POLL_INTERVAL_MS, signal);
+      }
+
+      if (signal.aborted) return;
+
+      if (!foundRange) {
+        updateJob(job, {
+          status: "failed",
+          message: `No availability detected after ${job.attempts} polls (${MAX_WATCH_DURATION_MS / 1000}s).`,
+        });
+        await saveJobs();
+        return;
+      }
+
+      // ---- Book using the permit flow ----
+      updateJob(job, {
+        status: "booking",
+        message: `Booking ${foundRange.startDate} - ${foundRange.endDate}...`,
+      });
+      await saveJobs();
+
+      const bookResult = await attemptBrowserBooking(page, job, foundRange);
+
+      if (bookResult === "booked") {
+        updateJob(job, {
+          status: "in-cart",
+          bookedRange: foundRange,
+          message: `${job.campgroundName} for ${foundRange.startDate} - ${foundRange.endDate} added to cart! Complete your purchase on recreation.gov.`,
+        });
+        await saveJobs();
+        return;
+      }
+
+      // Try fallback ranges
+      const remainingPermitRanges = job.desiredDateRanges.filter(
+        (r) => r.startDate !== foundRange!.startDate || r.endDate !== foundRange!.endDate,
+      );
+      for (const fallbackRange of remainingPermitRanges) {
+        if (signal.aborted) return;
+        const available = await checkPermitFacilityAvailability(job.campgroundId, [fallbackRange]);
+        if (!available) continue;
+
+        updateJob(job, {
+          message: `Primary range taken. Trying fallback: ${fallbackRange.startDate} - ${fallbackRange.endDate}...`,
+        });
+        const result = await attemptBrowserBooking(page, job, fallbackRange);
+        if (result === "booked") {
+          updateJob(job, {
+            status: "in-cart",
+            bookedRange: fallbackRange,
+            message: `${job.campgroundName} for ${fallbackRange.startDate} - ${fallbackRange.endDate} (fallback) added to cart!`,
+          });
+          await saveJobs();
+          return;
+        }
+      }
+
+      updateJob(job, {
+        status: "failed",
+        message: `Could not book any of the desired date ranges after ${job.attempts} attempts.`,
+      });
+    } else {
+      // ---- True campground: use camps availability API ----
+      let found: CampsiteAvailabilityResult | null = null;
+
+      while (!signal.aborted && Date.now() < watchDeadline) {
+        job.attempts++;
+        try {
+          found = await checkCampsiteAvailability(
+            job.campgroundId,
+            job.campsiteId,
+            job.desiredDateRanges,
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : "unknown error";
+          updateJob(job, {
+            message: `Poll #${job.attempts}: API error (${msg}). Retrying...`,
+          });
+        }
+
+        if (found) {
+          const siteLabel = job.campsiteId ? `site ${found.siteName}` : `site ${found.siteName} (auto-selected)`;
+          updateJob(job, {
+            message: `Availability detected on ${siteLabel} for ${found.range.startDate} - ${found.range.endDate}! Booking...`,
+          });
+          break;
+        }
+
+        updateJob(job, {
+          message: `Poll #${job.attempts}: No availability yet. Next check in ${POLL_INTERVAL_MS / 1000}s...`,
+        });
+        await sleep(POLL_INTERVAL_MS, signal);
+      }
+
+      if (signal.aborted) return;
+
+      if (!found) {
+        updateJob(job, {
+          status: "failed",
+          message: `No campsite availability detected after ${job.attempts} polls (${MAX_WATCH_DURATION_MS / 1000}s).`,
+        });
+        await saveJobs();
+        return;
+      }
+
+      // ---- Phase 3: Book ----
+      updateJob(job, {
+        status: "booking",
+        message: `Booking campsite ${found.siteName} for ${found.range.startDate} - ${found.range.endDate}...`,
+      });
+      await saveJobs();
+
+      const bookResult = await attemptCampsiteBooking(page, job, found.range, found.campsiteId);
+
+      if (bookResult === "booked") {
+        updateJob(job, {
+          status: "in-cart",
+          bookedRange: found.range,
+          bookedCampsiteId: found.campsiteId,
+          message: `Campsite ${found.siteName} for ${found.range.startDate} - ${found.range.endDate} added to cart! Complete your purchase on recreation.gov.`,
+        });
+        await saveJobs();
+        return;
+      }
+
+      // Try fallback ranges/sites
+      const remainingRanges = job.desiredDateRanges.filter(
+        (r) => r.startDate !== found!.range.startDate || r.endDate !== found!.range.endDate,
+      );
+      for (const fallbackRange of remainingRanges) {
+        if (signal.aborted) return;
+
+        const fallback = await checkCampsiteAvailability(
+          job.campgroundId,
+          job.campsiteId,
+          [fallbackRange],
+        );
+        if (!fallback) continue;
+
+        updateJob(job, {
+          message: `Primary range taken. Trying fallback: ${fallbackRange.startDate} - ${fallbackRange.endDate} on site ${fallback.siteName}...`,
+        });
+
+        const result = await attemptCampsiteBooking(page, job, fallbackRange, fallback.campsiteId);
+        if (result === "booked") {
+          updateJob(job, {
+            status: "in-cart",
+            bookedRange: fallbackRange,
+            bookedCampsiteId: fallback.campsiteId,
+            message: `Campsite ${fallback.siteName} for ${fallbackRange.startDate} - ${fallbackRange.endDate} (fallback) added to cart!`,
+          });
+          await saveJobs();
+          return;
+        }
+      }
+
+      updateJob(job, {
+        status: "failed",
+        message: `Could not book any campsite after ${job.attempts} attempts.`,
+      });
+    }
+    await saveJobs();
+  } catch (err) {
+    if (signal.aborted) return;
+    const msg = err instanceof Error ? err.message : "unknown error";
+    updateJob(job, {
+      status: "failed",
+      message: `Campsite sniper failed: ${msg}`,
+    });
+    await saveJobs();
+  } finally {
+    abortControllers.delete(job.id);
+
     if (job.status !== "in-cart") {
       const b = browsers.get(job.id);
       if (b) {
@@ -548,8 +876,7 @@ async function checkAvailability(
 
   const res = await fetch(url, {
     headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+      "User-Agent": WINDOWS_CHROME_UA,
       Accept: "application/json",
     },
   });
@@ -587,6 +914,169 @@ async function checkAvailability(
     const allAvailable = nights.every((d) => (availByDate.get(d) ?? 0) > 0);
     if (allAvailable) {
       return range;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Check availability across ALL divisions of a permit facility.
+ * Used when a "campground" in the UI is actually a permit-type facility.
+ */
+async function checkPermitFacilityAvailability(
+  permitId: string,
+  ranges: DateRange[],
+): Promise<DateRange | null> {
+  const allStartDates = ranges.map((r) => r.startDate).sort();
+  const allEndDates = ranges.map((r) => r.endDate).sort();
+  const queryStart = new Date(allStartDates[0] + "T00:00:00.000Z");
+  const queryEnd = new Date(allEndDates[allEndDates.length - 1] + "T00:00:00.000Z");
+  queryEnd.setUTCDate(queryEnd.getUTCDate() + 1);
+
+  const url = `${RECGOV_API}/${permitId}/availability?start_date=${queryStart.toISOString()}&end_date=${queryEnd.toISOString()}&commercial_acct=false`;
+
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": WINDOWS_CHROME_UA,
+      Accept: "application/json",
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}`);
+  }
+
+  const data = (await res.json()) as {
+    payload: {
+      availability: Record<
+        string,
+        {
+          date_availability: Record<
+            string,
+            { remaining: number; total: number }
+          >;
+        }
+      >;
+    };
+  };
+
+  // Check ALL divisions -- find the first one where a desired range is fully available
+  for (const [, division] of Object.entries(data.payload.availability)) {
+    const availByDate = new Map<string, number>();
+    for (const [isoDate, avail] of Object.entries(division.date_availability)) {
+      availByDate.set(isoDate.substring(0, 10), avail.remaining);
+    }
+
+    for (const range of ranges) {
+      const nights = expandRange(range);
+      const allAvailable = nights.every((d) => (availByDate.get(d) ?? 0) > 0);
+      if (allAvailable) {
+        return range;
+      }
+    }
+  }
+
+  return null;
+}
+
+// ---- Campsite availability polling (direct API, no browser) ----
+
+const RECGOV_CAMPS_API = "https://www.recreation.gov/api/camps/availability/campground";
+
+interface CampsiteAvailabilityResult {
+  range: DateRange;
+  campsiteId: string;
+  siteName: string;
+}
+
+/**
+ * Check campsite availability for a given campground.
+ * Uses recreation.gov's undocumented camps availability API.
+ *
+ * If campsiteId is provided, checks only that campsite.
+ * If campsiteId is empty, checks all campsites and returns the first fully-available one.
+ */
+async function checkCampsiteAvailability(
+  campgroundId: string,
+  campsiteId: string,
+  ranges: DateRange[],
+): Promise<CampsiteAvailabilityResult | null> {
+  const allStartDates = ranges.map((r) => r.startDate).sort();
+  const allEndDates = ranges.map((r) => r.endDate).sort();
+
+  // We need to query each month that overlaps the desired ranges
+  const startMonth = allStartDates[0].substring(0, 7);
+  const endMonth = allEndDates[allEndDates.length - 1].substring(0, 7);
+
+  // Collect availabilities across months
+  const campsiteAvail = new Map<string, { availabilities: Record<string, string>; site: string }>();
+
+  let currentMonth = startMonth;
+  while (currentMonth <= endMonth) {
+    const [y, m] = currentMonth.split("-").map(Number);
+    const startDate = new Date(Date.UTC(y, m - 1, 1)).toISOString();
+
+    const url = `${RECGOV_CAMPS_API}/${campgroundId}/month?start_date=${encodeURIComponent(startDate)}`;
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": WINDOWS_CHROME_UA,
+        Accept: "application/json",
+      },
+    });
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    const data = (await res.json()) as {
+      campsites: Record<
+        string,
+        {
+          availabilities: Record<string, string>;
+          campsite_id: string;
+          site: string;
+        }
+      >;
+    };
+
+    for (const [csId, cs] of Object.entries(data.campsites)) {
+      const existing = campsiteAvail.get(csId);
+      if (existing) {
+        Object.assign(existing.availabilities, cs.availabilities);
+      } else {
+        campsiteAvail.set(csId, {
+          availabilities: { ...cs.availabilities },
+          site: cs.site,
+        });
+      }
+    }
+
+    // Advance to next month
+    const nextM = m === 12 ? 1 : m + 1;
+    const nextY = m === 12 ? y + 1 : y;
+    currentMonth = `${nextY}-${String(nextM).padStart(2, "0")}`;
+  }
+
+  // Filter to target campsite if specified
+  const candidates = campsiteId
+    ? [[campsiteId, campsiteAvail.get(campsiteId)] as const].filter(([, v]) => v)
+    : Array.from(campsiteAvail.entries());
+
+  // Check ranges in priority order
+  for (const range of ranges) {
+    const nights = expandRange(range);
+
+    for (const [csId, cs] of candidates) {
+      if (!cs) continue;
+      const allAvailable = nights.every((d) => {
+        const isoKey = `${d}T00:00:00Z`;
+        return cs.availabilities[isoKey] === "Available";
+      });
+
+      if (allAvailable) {
+        return { range, campsiteId: csId, siteName: cs.site };
+      }
     }
   }
 
@@ -672,6 +1162,86 @@ async function debugPageState(
 
   jobLog(job, `[${label}] Page summary:`, JSON.stringify(summary, null, 2));
   await saveScreenshot(page, job, label);
+}
+
+// ---- "Something went wrong" traffic modal handler ----
+
+const MAX_TRAFFIC_RETRIES = 3;
+
+/**
+ * Recreation.gov shows a "Something went wrong" modal during heavy traffic.
+ * Detects it and clicks the Refresh button, waiting for the page to reload.
+ * Returns true if the modal was detected and handled.
+ */
+async function dismissTrafficModal(
+  page: Page,
+  job: SniperJob,
+  retries = MAX_TRAFFIC_RETRIES,
+): Promise<boolean> {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    const modal = page.locator('.sarsa-modal-content-body:has-text("Something went wrong")');
+    const isVisible = await modal.isVisible().catch(() => false);
+    if (!isVisible) return attempt > 0;
+
+    jobLog(job, `Traffic modal detected (attempt ${attempt + 1}/${retries}). Clicking Refresh...`);
+    await saveScreenshot(page, job, `traffic-modal-attempt-${attempt + 1}`);
+
+    const refreshBtn = modal.locator('button:has-text("Refresh")');
+    await refreshBtn.click({ timeout: 5000 });
+    await page.waitForTimeout(3000);
+  }
+
+  const stillVisible = await page
+    .locator('.sarsa-modal-content-body:has-text("Something went wrong")')
+    .isVisible()
+    .catch(() => false);
+
+  if (stillVisible) {
+    jobLog(job, `Traffic modal persists after ${retries} retries.`);
+    await saveScreenshot(page, job, "traffic-modal-persistent");
+  }
+
+  return true;
+}
+
+/**
+ * Navigate to a URL, handle the traffic modal, and detect 404-style pages.
+ * Recreation.gov is a SPA so HTTP status is always 200, but 404 pages contain
+ * "Please Bear With Us" or an empty/error body.
+ */
+async function safeGoto(
+  page: Page,
+  job: SniperJob,
+  url: string,
+  label: string,
+): Promise<{ is404: boolean }> {
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await page.waitForTimeout(1500);
+  await dismissTrafficModal(page, job);
+
+  const pageCheck = await page.evaluate(() => {
+    const text = document.body?.innerText || "";
+    const is404 =
+      text.includes("Please Bear With Us") ||
+      text.includes("page you were looking for") ||
+      text.includes("couldn't find what you're looking for");
+    const isError =
+      text.includes("an unexpected error occurred") ||
+      text.includes("Sorry, an unexpected error occurred");
+    return { is404, isError, bodyPreview: text.substring(0, 300) };
+  });
+
+  const isPageBroken = pageCheck.is404 || pageCheck.isError;
+
+  if (isPageBroken) {
+    jobLog(
+      job,
+      `Page error detected at ${url} (404=${pageCheck.is404}, error=${pageCheck.isError}). Body: ${pageCheck.bodyPreview}`,
+    );
+  }
+
+  await saveScreenshot(page, job, label);
+  return { is404: isPageBroken };
 }
 
 // ---- Group size selection ----
@@ -782,11 +1352,12 @@ async function attemptBrowserBooking(
   targetRange: DateRange,
 ): Promise<"booked" | "failed"> {
   try {
-    const url = `https://www.recreation.gov/permits/${job.permitId}/registration/detailed-availability?date=${targetRange.startDate}&type=overnight`;
+    const facilityId = job.permitId || job.campgroundId;
+    const url = `https://www.recreation.gov/permits/${facilityId}/registration/detailed-availability?date=${targetRange.startDate}&type=overnight`;
     jobLog(job, "Navigating to:", url);
     await logStepTiming(job, "goto booking page + hydrate", async () => {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-      await page.waitForTimeout(3000); // let JS hydrate
+      await safeGoto(page, job, url, "booking-page-loaded-nav");
+      await page.waitForTimeout(1500);
     });
 
     await logStepTiming(job, "set group size (booking)", () =>
@@ -1025,6 +1596,186 @@ async function fillOrderDetails(page: Page, job: SniperJob): Promise<boolean> {
     jobLog(job, "Error filling order details:", msg);
     await saveScreenshot(page, job, "order-details-error");
     return false;
+  }
+}
+
+// ---- Campsite browser booking ----
+
+async function attemptCampsiteBooking(
+  page: Page,
+  job: SniperJob,
+  targetRange: DateRange,
+  targetCampsiteId: string,
+): Promise<"booked" | "failed"> {
+  try {
+    // Recreation.gov campground availability page
+    const url = `https://www.recreation.gov/camping/campgrounds/${job.campgroundId}/availability`;
+    jobLog(job, "Navigating to campground:", url);
+    await logStepTiming(job, "goto campground page + hydrate", async () => {
+      await safeGoto(page, job, url, "campground-page-loaded");
+      await page.waitForTimeout(1500);
+    });
+
+    // Set the check-in date using the date picker
+    jobLog(job, `Setting dates: ${targetRange.startDate} to ${targetRange.endDate}...`);
+    await logStepTiming(job, "set campsite dates", async () => {
+      // Try the start-date input
+      const startInput = page.locator('input#campground-start-date, input[name="startDate"], input[data-component="StartDate"]');
+      const endInput = page.locator('input#campground-end-date, input[name="endDate"], input[data-component="EndDate"]');
+
+      try {
+        await startInput.first().waitFor({ timeout: 5000 });
+
+        // Format dates for the input (MM/DD/YYYY)
+        const sd = new Date(targetRange.startDate + "T00:00:00");
+        const ed = new Date(targetRange.endDate + "T00:00:00");
+        const startFormatted = `${String(sd.getMonth() + 1).padStart(2, "0")}/${String(sd.getDate()).padStart(2, "0")}/${sd.getFullYear()}`;
+        const endFormatted = `${String(ed.getMonth() + 1).padStart(2, "0")}/${String(ed.getDate()).padStart(2, "0")}/${ed.getFullYear()}`;
+
+        await startInput.first().click();
+        await startInput.first().fill(startFormatted);
+        await page.waitForTimeout(500);
+        await endInput.first().click();
+        await endInput.first().fill(endFormatted);
+        await page.waitForTimeout(500);
+
+        // Press Enter or click search to apply dates
+        await page.keyboard.press("Enter");
+        await page.waitForTimeout(2000);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        jobLog(job, "Date input method failed, trying URL params:", msg);
+        // Fallback: navigate with date params in URL
+        const paramUrl = `${url}?start_date=${targetRange.startDate}&end_date=${targetRange.endDate}`;
+        await safeGoto(page, job, paramUrl, "campsite-dates-fallback");
+        await page.waitForTimeout(1500);
+      }
+    });
+
+    await saveScreenshot(page, job, "campsite-dates-set");
+
+    // Find and click the target campsite's "Book" button
+    jobLog(job, `Looking for campsite ${targetCampsiteId}...`);
+    let bookClicked = false;
+
+    await logStepTiming(job, "find and book campsite", async () => {
+      // Recreation.gov campground availability shows a list of campsites
+      // Each row has the site name/number and availability cells or a "Book" button
+
+      // Strategy 1: Find by campsite data attribute or aria-label
+      const siteRow = page.locator(
+        `[data-campsite-id="${targetCampsiteId}"], tr:has([data-campsite-id="${targetCampsiteId}"])`
+      );
+
+      try {
+        if (await siteRow.count() > 0) {
+          const bookBtn = siteRow.first().locator('button:has-text("Book"), a:has-text("Book")');
+          if (await bookBtn.count() > 0) {
+            await bookBtn.first().click({ timeout: 5000 });
+            bookClicked = true;
+            jobLog(job, "Clicked Book via data-campsite-id selector");
+          }
+        }
+      } catch {
+        jobLog(job, "data-campsite-id selector failed, trying alternatives...");
+      }
+
+      // Strategy 2: Click available cells in the availability grid
+      if (!bookClicked) {
+        try {
+          const nightDates = expandRange(targetRange);
+          let clickCount = 0;
+
+          for (const nightDate of nightDates) {
+            const d = new Date(nightDate + "T00:00:00");
+            const monthName = d.toLocaleString("en-US", { month: "long", timeZone: "UTC" });
+            const dayOfMonth = d.getUTCDate();
+            const year = d.getUTCFullYear();
+            const ariaDateStr = `${monthName} ${dayOfMonth}, ${year}`;
+
+            const btn = page.locator(
+              `button[aria-label*="${ariaDateStr}"][aria-label*="Available"]:not([disabled])`
+            );
+            if (await btn.count() > 0) {
+              await btn.first().click({ timeout: 5000 });
+              clickCount++;
+              await page.waitForTimeout(300);
+            }
+          }
+
+          if (clickCount > 0) {
+            jobLog(job, `Clicked ${clickCount} date cells`);
+
+            // Look for Book Now button
+            for (const label of ["Book Now", "Add to Cart", "Reserve", "Continue"]) {
+              const btn = page.locator(`button:has-text("${label}")`);
+              if (await btn.count() > 0) {
+                await btn.first().click({ timeout: 5000 });
+                bookClicked = true;
+                jobLog(job, `Clicked "${label}" button`);
+                break;
+              }
+            }
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          jobLog(job, "Cell-clicking strategy failed:", msg);
+        }
+      }
+
+      // Strategy 3: Use page.evaluate to find and click the site row
+      if (!bookClicked) {
+        const result = await page.evaluate(`(() => {
+          const rows = document.querySelectorAll('[class*="campsite-row"], [class*="site-row"], tr[data-component="CampsiteRow"]');
+          for (const row of rows) {
+            const text = row.textContent || '';
+            if (text.includes('Available')) {
+              const btn = row.querySelector('button:not([disabled])');
+              if (btn) {
+                btn.click();
+                return 'clicked';
+              }
+            }
+          }
+          return 'not-found';
+        })()`);
+
+        if (result === "clicked") {
+          bookClicked = true;
+          jobLog(job, "Clicked campsite via evaluate fallback");
+        }
+      }
+    });
+
+    if (!bookClicked) {
+      jobLog(job, "No campsite booking button found");
+      await saveScreenshot(page, job, "campsite-no-book-button");
+      return "failed";
+    }
+
+    await page.waitForTimeout(2500);
+    await saveScreenshot(page, job, "campsite-after-book-click");
+
+    // Fill order details (same form as permits)
+    let orderSuccess = false;
+    await logStepTiming(job, "fill order details + proceed to cart", async () => {
+      orderSuccess = await fillOrderDetails(page, job);
+    });
+
+    if (orderSuccess) {
+      jobLog(job, "Campsite order details filled and proceeded to cart!");
+      return "booked";
+    } else {
+      jobLog(job, "Order details filling failed, but booking was clicked.");
+      return "booked";
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    jobLog(job, "attemptCampsiteBooking error:", msg);
+    try {
+      await saveScreenshot(page, job, "campsite-booking-error");
+    } catch { /* ignore */ }
+    return "failed";
   }
 }
 

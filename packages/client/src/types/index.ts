@@ -90,7 +90,33 @@ export interface BookingState {
   createdAt: string;
 }
 
+// ---- Campground Types ----
+
+export interface CampgroundSummary {
+  facilityId: string;
+  name: string;
+  description: string;
+  latitude: number;
+  longitude: number;
+  reservable: boolean;
+  links: { title: string; url: string }[];
+  campsiteCount: number;
+  isPermitFacility: boolean;
+}
+
+export interface CampsiteSummary {
+  campsiteId: string;
+  campsiteName: string;
+  campsiteType: string;
+  loop: string;
+  maxPeople: number;
+  minPeople: number;
+  typeOfUse: string;
+}
+
 // ---- Sniper Types ----
+
+export type BookingType = "permit" | "campsite";
 
 export type SniperStatus =
   | "pending"
@@ -108,10 +134,19 @@ export interface DateRange {
 
 export interface SniperJob {
   id: string;
+  bookingType: BookingType;
+  // Permit fields
   permitId: string;
   permitName: string;
   divisionId: string;
-  desiredDateRanges: DateRange[]; // in priority order
+  // Campsite fields
+  campgroundId: string;
+  campgroundName: string;
+  campgroundIsPermit: boolean;
+  campsiteId: string;
+  bookedCampsiteId: string;
+  // Common fields
+  desiredDateRanges: DateRange[];
   groupSize: number;
   windowOpensAt: string;
   status: SniperStatus;
@@ -123,9 +158,17 @@ export interface SniperJob {
 }
 
 export interface SniperJobRequest {
-  permitId: string;
-  permitName: string;
-  divisionId: string;
+  bookingType: BookingType;
+  // Permit fields
+  permitId?: string;
+  permitName?: string;
+  divisionId?: string;
+  // Campsite fields
+  campgroundId?: string;
+  campgroundName?: string;
+  campgroundIsPermit?: boolean;
+  campsiteId?: string;
+  // Common fields
   desiredDateRanges: DateRange[];
   groupSize: number;
   windowOpensAt: string;

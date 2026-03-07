@@ -2,10 +2,13 @@ import type {
   RIDBFacility,
   RIDBPermitEntrance,
   RIDBZone,
+  RIDBCampsite,
   RIDBPaginatedResponse,
   PermitSummary,
   PermitDetail,
   PermitEntrance,
+  CampgroundSummary,
+  CampsiteSummary,
 } from "../types/index.js";
 
 const RIDB_BASE = "https://ridb.recreation.gov/api/v1";
@@ -66,10 +69,18 @@ function setCache<T>(key: string, data: T): void {
 
 /**
  * Fetch all Oregon facilities that have permit entrances.
- * Paginates through results since RIDB returns max 50 per request.
+ * Kept for backward compatibility.
  */
 export async function getOregonPermitFacilities(): Promise<PermitSummary[]> {
-  const cacheKey = "or-permit-facilities";
+  return getPermitFacilities("OR");
+}
+
+/**
+ * Fetch permit facilities for a given state.
+ * Paginates through results since RIDB returns max 50 per request.
+ */
+export async function getPermitFacilities(state: string): Promise<PermitSummary[]> {
+  const cacheKey = `${state.toLowerCase()}-permit-facilities`;
   const cached = getCached<PermitSummary[]>(cacheKey);
   if (cached) return cached;
 
@@ -77,12 +88,11 @@ export async function getOregonPermitFacilities(): Promise<PermitSummary[]> {
   let offset = 0;
   const limit = 50;
 
-  // Paginate through all results
   while (true) {
     const response = await ridbFetch<RIDBPaginatedResponse<RIDBFacility>>(
       "/facilities",
       {
-        state: "OR",
+        state,
         query: "permit",
         full: "true",
         limit: String(limit),
@@ -110,6 +120,117 @@ export async function getOregonPermitFacilities(): Promise<PermitSummary[]> {
     reservable: f.Reservable,
     links: (f.LINK || []).map((l) => ({ title: l.Title, url: l.URL })),
     entranceCount: (f.PERMITENTRANCE || []).length,
+  }));
+
+  setCache(cacheKey, summaries);
+  return summaries;
+}
+
+/**
+ * Fetch campground facilities for a given state.
+ * Uses RIDB activity filter for camping.
+ */
+export async function getCampgroundFacilities(state: string): Promise<CampgroundSummary[]> {
+  const cacheKey = `${state.toLowerCase()}-campground-facilities`;
+  const cached = getCached<CampgroundSummary[]>(cacheKey);
+  if (cached) return cached;
+
+  const allFacilities: RIDBFacility[] = [];
+  let offset = 0;
+  const limit = 50;
+
+  while (true) {
+    const response = await ridbFetch<RIDBPaginatedResponse<RIDBFacility>>(
+      "/facilities",
+      {
+        state,
+        activity: "CAMPING",
+        full: "true",
+        limit: String(limit),
+        offset: String(offset),
+      },
+    );
+
+    allFacilities.push(...response.RECDATA);
+
+    if (
+      response.RECDATA.length < limit ||
+      allFacilities.length >= response.METADATA.RESULTS.TOTAL_COUNT
+    ) {
+      break;
+    }
+    offset += limit;
+  }
+
+  // Only include reservable facilities
+  const reservable = allFacilities.filter((f) => f.Reservable);
+
+  const summaries: CampgroundSummary[] = reservable.map((f) => ({
+    facilityId: f.FacilityID,
+    name: f.FacilityName,
+    description: f.FacilityDescription,
+    latitude: f.FacilityLatitude,
+    longitude: f.FacilityLongitude,
+    reservable: f.Reservable,
+    links: (f.LINK || []).map((l) => ({ title: l.Title, url: l.URL })),
+    campsiteCount: 0,
+    isPermitFacility: (f.PERMITENTRANCE || []).length > 0,
+  }));
+
+  setCache(cacheKey, summaries);
+  return summaries;
+}
+
+/**
+ * Fetch campsites for a specific campground facility from RIDB.
+ */
+export async function getCampsitesForFacility(facilityId: string): Promise<CampsiteSummary[]> {
+  const cacheKey = `campsites-${facilityId}`;
+  const cached = getCached<CampsiteSummary[]>(cacheKey);
+  if (cached) return cached;
+
+  const allCampsites: RIDBCampsite[] = [];
+  let offset = 0;
+  const limit = 50;
+
+  while (true) {
+    const response = await ridbFetch<RIDBPaginatedResponse<RIDBCampsite>>(
+      `/facilities/${facilityId}/campsites`,
+      {
+        limit: String(limit),
+        offset: String(offset),
+      },
+    );
+
+    allCampsites.push(...response.RECDATA);
+
+    if (
+      response.RECDATA.length < limit ||
+      allCampsites.length >= response.METADATA.RESULTS.TOTAL_COUNT
+    ) {
+      break;
+    }
+    offset += limit;
+  }
+
+  const maxPeopleAttr = (cs: RIDBCampsite) => {
+    const attr = (cs.ATTRIBUTES || []).find((a) => a.AttributeName === "Max Num of People");
+    return attr ? parseInt(attr.AttributeValue, 10) || 0 : 0;
+  };
+
+  const minPeopleAttr = (cs: RIDBCampsite) => {
+    const attr = (cs.ATTRIBUTES || []).find((a) => a.AttributeName === "Min Num of People");
+    return attr ? parseInt(attr.AttributeValue, 10) || 0 : 0;
+  };
+
+  const summaries: CampsiteSummary[] = allCampsites.map((cs) => ({
+    campsiteId: cs.CampsiteID,
+    campsiteName: cs.CampsiteName,
+    campsiteType: cs.CampsiteType,
+    loop: cs.Loop,
+    maxPeople: maxPeopleAttr(cs),
+    minPeople: minPeopleAttr(cs),
+    typeOfUse: cs.TypeOfUse,
   }));
 
   setCache(cacheKey, summaries);

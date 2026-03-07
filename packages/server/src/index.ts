@@ -6,6 +6,7 @@ import fs from "fs";
 import { permitRoutes } from "./routes/permits.js";
 import { bookingRoutes } from "./routes/booking.js";
 import { sniperRoutes } from "./routes/sniper.js";
+import { campgroundRoutes } from "./routes/campgrounds.js";
 import { closeBrowser } from "./services/availability.js";
 import { cleanupAllBookings } from "./services/booking.js";
 import {
@@ -23,6 +24,7 @@ app.use(express.json());
 app.use("/api/permits", permitRoutes);
 app.use("/api/booking", bookingRoutes);
 app.use("/api/sniper", sniperRoutes);
+app.use("/api/campgrounds", campgroundRoutes);
 
 app.get("/api/health", (_req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });

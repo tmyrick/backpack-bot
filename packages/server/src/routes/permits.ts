@@ -1,6 +1,6 @@
 import { Router } from "express";
 import {
-  getOregonPermitFacilities,
+  getPermitFacilities,
   getPermitDetail,
 } from "../services/ridb.js";
 import { scrapeAvailability } from "../services/availability.js";
@@ -8,12 +8,13 @@ import { scrapeAvailability } from "../services/availability.js";
 const router = Router();
 
 /**
- * GET /api/permits
- * Returns all Oregon permit facilities.
+ * GET /api/permits?state=OR
+ * Returns permit facilities for a given state (defaults to OR).
  */
-router.get("/", async (_req, res) => {
+router.get("/", async (req, res) => {
   try {
-    const permits = await getOregonPermitFacilities();
+    const state = (req.query.state as string || "OR").toUpperCase();
+    const permits = await getPermitFacilities(state);
     res.json({ permits });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";

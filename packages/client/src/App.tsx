@@ -1,4 +1,4 @@
-import { Routes, Route } from "react-router-dom";
+import { Routes, Route, Navigate } from "react-router-dom";
 import Layout from "./components/Layout";
 import PermitsPage from "./pages/PermitsPage";
 import PermitDetailPage from "./pages/PermitDetailPage";
@@ -9,10 +9,11 @@ export default function App() {
   return (
     <Routes>
       <Route element={<Layout />}>
-        <Route path="/" element={<PermitsPage />} />
+        <Route path="/" element={<SniperPage />} />
+        <Route path="/sniper" element={<Navigate to="/" replace />} />
+        <Route path="/permits" element={<PermitsPage />} />
         <Route path="/permits/:permitId" element={<PermitDetailPage />} />
         <Route path="/booking" element={<BookingPage />} />
-        <Route path="/sniper" element={<SniperPage />} />
       </Route>
     </Routes>
   );

@@ -16,13 +16,23 @@ export const sniperRoutes = Router();
 sniperRoutes.post("/", async (req: Request, res: Response) => {
   try {
     const body = req.body as SniperJobRequest;
+    const bookingType = body.bookingType || "permit";
 
-    // Validate required fields
-    if (!body.permitId || !body.desiredDateRanges?.length || !body.windowOpensAt) {
+    // Validate required fields based on booking type
+    if (!body.desiredDateRanges?.length || !body.windowOpensAt) {
       res.status(400).json({
-        error:
-          "Missing required fields: permitId, desiredDateRanges, windowOpensAt",
+        error: "Missing required fields: desiredDateRanges, windowOpensAt",
       });
+      return;
+    }
+
+    if (bookingType === "permit" && !body.permitId) {
+      res.status(400).json({ error: "Missing required field: permitId" });
+      return;
+    }
+
+    if (bookingType === "campsite" && !body.campgroundId) {
+      res.status(400).json({ error: "Missing required field: campgroundId" });
       return;
     }
 

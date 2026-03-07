@@ -6,6 +6,8 @@ import type {
   BookingState,
   SniperJob,
   SniperJobRequest,
+  CampgroundSummary,
+  CampsiteSummary,
 } from "../types/index.js";
 
 const API_BASE = "/api";
@@ -24,9 +26,21 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
 
 // ---- Permits ----
 
-export async function fetchPermits(): Promise<PermitSummary[]> {
-  const data = await apiFetch<{ permits: PermitSummary[] }>("/permits");
+export async function fetchPermits(state: string = "OR"): Promise<PermitSummary[]> {
+  const data = await apiFetch<{ permits: PermitSummary[] }>(`/permits?state=${encodeURIComponent(state)}`);
   return data.permits;
+}
+
+// ---- Campgrounds ----
+
+export async function fetchCampgrounds(state: string = "OR"): Promise<CampgroundSummary[]> {
+  const data = await apiFetch<{ campgrounds: CampgroundSummary[] }>(`/campgrounds?state=${encodeURIComponent(state)}`);
+  return data.campgrounds;
+}
+
+export async function fetchCampsites(campgroundId: string): Promise<CampsiteSummary[]> {
+  const data = await apiFetch<{ campsites: CampsiteSummary[] }>(`/campgrounds/${campgroundId}/campsites`);
+  return data.campsites;
 }
 
 export async function fetchPermitDetail(
