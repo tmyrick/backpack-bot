@@ -628,26 +628,24 @@ async function runCampsiteSniperJob(job: SniperJob): Promise<void> {
     jobLog(job, "Sign-in complete. Current URL:", page.url());
     if (signal.aborted) return;
 
-    // Navigate to the right page based on facility type
+    // Always try permits path first, fall back to campgrounds path
     const firstRange = job.desiredDateRanges[0];
-    let campUrl = job.campgroundIsPermit
-      ? `https://www.recreation.gov/permits/${job.campgroundId}/registration/detailed-availability?date=${firstRange.startDate}&type=overnight`
-      : `https://www.recreation.gov/camping/campgrounds/${job.campgroundId}/availability`;
+    let campUrl = `https://www.recreation.gov/permits/${job.campgroundId}/registration/detailed-availability?date=${firstRange.startDate}&type=overnight`;
     jobLog(job, "Navigating to:", campUrl);
 
     let navResult = await logStepTiming(job, "goto facility page + hydrate", async () => {
       return await safeGoto(page, job, campUrl, "campground-page-prewarm");
     });
 
-    // If we got a 404 on the campground URL, this is likely a permit-type facility
-    if (navResult?.is404 && !job.campgroundIsPermit) {
-      jobLog(job, "Campground URL returned 404. Falling back to permit URL...");
-      job.campgroundIsPermit = true;
-      campUrl = `https://www.recreation.gov/permits/${job.campgroundId}/registration/detailed-availability?date=${firstRange.startDate}&type=overnight`;
-      jobLog(job, "Navigating to permit URL:", campUrl);
-      navResult = await logStepTiming(job, "goto permit page (fallback) + hydrate", async () => {
-        return await safeGoto(page, job, campUrl, "permit-page-fallback");
+    if (navResult?.is404) {
+      jobLog(job, "Permit URL returned 404. Falling back to campground URL...");
+      campUrl = `https://www.recreation.gov/camping/campgrounds/${job.campgroundId}/availability`;
+      jobLog(job, "Navigating to campground URL:", campUrl);
+      navResult = await logStepTiming(job, "goto campground page (fallback) + hydrate", async () => {
+        return await safeGoto(page, job, campUrl, "campground-page-fallback");
       });
+    } else {
+      job.campgroundIsPermit = true;
       await saveJobs();
     }
 
@@ -1195,75 +1193,37 @@ async function saveScreenshot(
 }
 
 /**
- * Dismiss the "outdated browser" banner that recreation.gov shows for Playwright browsers.
- * Clicks the "Ignore" button if present.
+ * Detect a login modal/form that recreation.gov shows when the session expires.
+ * Instead of trying to re-auth inside the unreliable modal, navigates to the
+ * full login page and uses the proven signIn() flow.
+ * Returns true if login was needed (caller should retry booking steps).
  */
-/**
- * Detect and handle a login modal that recreation.gov shows when
- * the session expires or a booking action requires re-authentication.
- */
-async function handleLoginModal(page: Page, job: SniperJob): Promise<void> {
+async function handleLoginModal(page: Page, job: SniperJob): Promise<boolean> {
   const loginModal = page.locator('input#email, input[type="email"]').first();
   const isLoginVisible = await loginModal.isVisible({ timeout: 2000 }).catch(() => false);
 
-  if (!isLoginVisible) return;
+  if (!isLoginVisible) return false;
 
-  // Check if this is actually a login form (has password field too)
   const hasPassword = await page.locator('input#rec-acct-sign-in-password, input[type="password"]')
     .first().isVisible().catch(() => false);
-  if (!hasPassword) return;
+  if (!hasPassword) return false;
 
-  jobLog(job, "Login modal detected after booking action. Re-authenticating...");
+  jobLog(job, "Login modal detected after booking action. Re-authenticating via full login page...");
   await saveScreenshot(page, job, "login-modal-detected");
-
-  // #region agent log
-  const btnInfo = await page.evaluate(() => { const allBtns = Array.from(document.querySelectorAll('button')); const loginBtns = allBtns.filter(b => b.textContent?.toLowerCase().includes('log in') || b.textContent?.toLowerCase().includes('sign in')); const modalContent = document.querySelector('.ReactModal__Content'); const modalBtns = modalContent ? Array.from(modalContent.querySelectorAll('button')).map(b => ({ text: b.textContent?.trim(), classes: b.className, id: b.id })) : []; const recAcctBtn = document.querySelector('button.rec-acct-sign-in-btn'); return { loginBtns: loginBtns.map(b => ({ text: b.textContent?.trim(), id: b.id, classes: b.className })), modalBtns, hasRecAcctBtn: !!recAcctBtn, recAcctBtnVisible: recAcctBtn ? getComputedStyle(recAcctBtn).display !== 'none' : false, hasBuorg: !!document.getElementById('buorg') }; });
-  fetch('http://127.0.0.1:7652/ingest/7cc9222c-5337-4c71-9605-a392db73bbc9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'e44772'},body:JSON.stringify({sessionId:'e44772',location:'sniper.ts:handleLoginModal',message:'modal button analysis',data:btnInfo,timestamp:Date.now(),hypothesisId:'A,C'})}).catch(()=>{});
-  // #endregion
-
-  await dismissOutdatedBrowserBanner(page);
 
   const creds = getRecgovCredentials();
 
   try {
-    await page.locator('input#email, input[type="email"]').first().fill(creds.email);
-    await page.waitForTimeout(humanDelay(300, 600));
-    await page.locator('input#rec-acct-sign-in-password, input[type="password"]').first().fill(creds.password);
-    await page.waitForTimeout(humanDelay(300, 600));
-
-    // #region agent log
-    fetch('http://127.0.0.1:7652/ingest/7cc9222c-5337-4c71-9605-a392db73bbc9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'e44772'},body:JSON.stringify({sessionId:'e44772',location:'sniper.ts:handleLoginModal:beforeClick',message:'about to click login btn',data:{selector:'button.rec-acct-sign-in-btn'},timestamp:Date.now(),hypothesisId:'A'})}).catch(()=>{});
-    // #endregion
-
-    const recAcctBtn = page.locator('button.rec-acct-sign-in-btn');
-    const hasRecAcct = await recAcctBtn.isVisible({ timeout: 2000 }).catch(() => false);
-
-    if (hasRecAcct) {
-      await recAcctBtn.click({ timeout: 5000 });
-    } else {
-      const modalLoginBtn = page.locator('.ReactModal__Content button:has-text("Log In")');
-      const hasModalBtn = await modalLoginBtn.isVisible({ timeout: 2000 }).catch(() => false);
-      if (hasModalBtn) {
-        await modalLoginBtn.click({ timeout: 5000 });
-      } else {
-        const loginBtn = page.locator('button[type="submit"]:has-text("Log In")');
-        await loginBtn.first().click({ timeout: 5000 });
-      }
-    }
-
-    // #region agent log
-    fetch('http://127.0.0.1:7652/ingest/7cc9222c-5337-4c71-9605-a392db73bbc9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'e44772'},body:JSON.stringify({sessionId:'e44772',location:'sniper.ts:handleLoginModal:afterClick',message:'login btn clicked successfully',data:{usedRecAcct:hasRecAcct},timestamp:Date.now(),hypothesisId:'A,C'})}).catch(()=>{});
-    // #endregion
-
-    // Wait for the modal to close and page to update
-    await page.waitForTimeout(3000);
-    jobLog(job, "Re-authentication complete. URL:", page.url());
-    await saveScreenshot(page, job, "after-reauth");
+    await signIn(page, creds.email, creds.password);
+    jobLog(job, "Re-authentication via full login page succeeded.");
+    await saveScreenshot(page, job, "reauth-success");
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    jobLog(job, "Re-authentication failed:", msg);
+    jobLog(job, "Re-authentication via full login failed:", msg);
     await saveScreenshot(page, job, "reauth-failed");
   }
+
+  return true;
 }
 
 async function dismissOutdatedBrowserBanner(page: Page): Promise<void> {
@@ -1746,7 +1706,70 @@ async function attemptBrowserBooking(
     });
 
     // Check if a login modal appeared after clicking Book Now
-    await handleLoginModal(page, job);
+    const loginNeeded = await handleLoginModal(page, job);
+
+    if (loginNeeded) {
+      jobLog(job, "Session expired mid-booking. Retrying booking flow after re-auth...");
+
+      const facilityId2 = job.permitId || job.campgroundId;
+      const retryUrl = `https://www.recreation.gov/permits/${facilityId2}/registration/detailed-availability?date=${targetRange.startDate}&type=overnight`;
+      jobLog(job, "Re-navigating to:", retryUrl);
+      await safeGoto(page, job, retryUrl, "retry-booking-nav");
+      await page.waitForTimeout(1500);
+
+      await setGroupSize(page, job);
+      if (job.startingArea) {
+        await clickStartingAreaFilter(page, job);
+      }
+      await page.waitForTimeout(humanDelay(800, 1500));
+      await debugPageState(page, job, "retry-booking-page");
+
+      const retryNightDates = expandRange(targetRange);
+      let retryClickCount = 0;
+      for (const nightDate of retryNightDates) {
+        const d = new Date(nightDate + "T00:00:00");
+        const monthName = d.toLocaleString("en-US", { month: "long", timeZone: "UTC" });
+        const dayOfMonth = d.getUTCDate();
+        const year = d.getUTCFullYear();
+        const ariaDateStr = `${monthName} ${dayOfMonth}, ${year}`;
+
+        let selector: string;
+        if (job.trailheadName) {
+          selector = `button.rec-availability-date[aria-label*="${job.trailheadName}"][aria-label*="${ariaDateStr}"][aria-label*="Available"]:not([disabled])`;
+        } else {
+          selector = `button.rec-availability-date[aria-label*="${ariaDateStr}"][aria-label*="Available"]:not([disabled])`;
+        }
+
+        jobLog(job, `[retry] Looking for date cell: ${ariaDateStr}...`);
+        const cells = page.locator(selector);
+        const count = await cells.count();
+        if (count > 0) {
+          await cells.first().click();
+          retryClickCount++;
+          jobLog(job, `  [retry] Clicked! (${retryClickCount} total)`);
+          await page.waitForTimeout(humanDelay(400, 800));
+        }
+      }
+
+      if (retryClickCount === 0) {
+        jobLog(job, "[retry] No date cells found after re-auth.");
+        await saveScreenshot(page, job, "retry-no-dates");
+        return "failed";
+      }
+
+      await page.waitForTimeout(humanDelay(500, 1000));
+      const retryBookBtn = page.locator('button:has-text("Book Now")');
+      if ((await retryBookBtn.count()) > 0) {
+        await retryBookBtn.first().click({ timeout: 5000 });
+        jobLog(job, "[retry] Clicked Book Now!");
+        await page.waitForTimeout(2500);
+        await saveScreenshot(page, job, "retry-after-book-click");
+      } else {
+        jobLog(job, "[retry] No Book Now button found.");
+        await saveScreenshot(page, job, "retry-no-book-btn");
+        return "failed";
+      }
+    }
 
     let orderSuccess = false;
     await logStepTiming(job, "fill order details + proceed to cart", async () => {
@@ -1757,7 +1780,6 @@ async function attemptBrowserBooking(
       return "booked";
     } else {
       jobLog(job, "Order details filling failed, but booking was clicked. Check browser.");
-      // Still return booked since the reservation is selected
       return "booked";
     }
   } catch (err) {
@@ -1882,13 +1904,23 @@ async function attemptCampsiteBooking(
   targetCampsiteId: string,
 ): Promise<"booked" | "failed"> {
   try {
-    // Recreation.gov campground availability page
-    const url = `https://www.recreation.gov/camping/campgrounds/${job.campgroundId}/availability`;
-    jobLog(job, "Navigating to campground:", url);
-    await logStepTiming(job, "goto campground page + hydrate", async () => {
-      await safeGoto(page, job, url, "campground-page-loaded");
+    // Try permits path first, fall back to campgrounds path
+    let url = `https://www.recreation.gov/permits/${job.campgroundId}/registration/detailed-availability?date=${targetRange.startDate}&type=overnight`;
+    jobLog(job, "Navigating to:", url);
+    let navRes = await logStepTiming(job, "goto facility page + hydrate", async () => {
+      const r = await safeGoto(page, job, url, "campground-page-loaded");
       await page.waitForTimeout(1500);
+      return r;
     });
+
+    if (navRes?.is404) {
+      jobLog(job, "Permit URL returned 404. Falling back to campground URL...");
+      url = `https://www.recreation.gov/camping/campgrounds/${job.campgroundId}/availability`;
+      await logStepTiming(job, "goto campground page (fallback) + hydrate", async () => {
+        await safeGoto(page, job, url, "campground-page-fallback");
+        await page.waitForTimeout(1500);
+      });
+    }
 
     // Set the check-in date using the date picker
     jobLog(job, `Setting dates: ${targetRange.startDate} to ${targetRange.endDate}...`);
@@ -2061,10 +2093,26 @@ async function signIn(
   password: string,
 ): Promise<void> {
   console.log("[sniper] Signing in...");
-  await page.goto("https://www.recreation.gov/log-in", {
-    waitUntil: "domcontentloaded",
-    timeout: 60000,
-  });
+
+  const maxRetries = 3;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      await page.goto("https://www.recreation.gov/log-in", {
+        waitUntil: "domcontentloaded",
+        timeout: 60000,
+      });
+      break;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (attempt < maxRetries && (msg.includes("ERR_HTTP_RESPONSE_CODE_FAILURE") || msg.includes("ERR_TIMED_OUT") || msg.includes("ERR_CONNECTION"))) {
+        console.log(`[sniper] Sign-in page load failed (attempt ${attempt}/${maxRetries}): ${msg.slice(0, 100)}. Retrying in ${attempt * 3}s...`);
+        await page.waitForTimeout(attempt * 3000);
+        continue;
+      }
+      throw err;
+    }
+  }
+
   await page.waitForTimeout(1500);
   await dismissOutdatedBrowserBanner(page);
 
