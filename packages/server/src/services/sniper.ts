@@ -29,7 +29,7 @@ const JOBS_FILE = path.join(DATA_DIR, "sniper-jobs.json");
 const SCREENSHOTS_DIR = path.join(DATA_DIR, "screenshots");
 
 const PRE_WARM_LEAD_MS = 2 * 60 * 1000; // 2 minutes before window
-const POLL_INTERVAL_MS = 1_000; // 1 second — faster detection when window opens
+const POLL_INTERVAL_MS = 4_000; // 4 seconds base — jittered in practice
 const MAX_WATCH_DURATION_MS = 60 * 1000; // 60 seconds of polling
 const RECGOV_API = "https://www.recreation.gov/api/permits";
 
@@ -382,15 +382,19 @@ async function runPermitSniperJob(job: SniperJob): Promise<void> {
 
     if (signal.aborted) return;
 
-    jobLog(job, `Setting group size to ${job.groupSize}...`);
-    await logStepTiming(job, "set group size (pre-warm)", () =>
-      setGroupSize(page, job),
-    );
-
-    if (job.startingArea) {
-      await logStepTiming(job, "click starting area filter (pre-warm)", () =>
-        clickStartingAreaFilter(page, job),
+    try {
+      jobLog(job, `Attempting to set group size during pre-warm (may not be available yet)...`);
+      await logStepTiming(job, "set group size (pre-warm)", () =>
+        setGroupSize(page, job),
       );
+
+      if (job.startingArea) {
+        await logStepTiming(job, "click starting area filter (pre-warm)", () =>
+          clickStartingAreaFilter(page, job),
+        );
+      }
+    } catch {
+      jobLog(job, "Group size / starting area not available during pre-warm (window likely not open yet). Will set during booking.");
     }
 
     // Wait until window opens
@@ -460,7 +464,7 @@ async function runPermitSniperJob(job: SniperJob): Promise<void> {
         message: `Poll #${job.attempts}: No availability yet. Next check in ${POLL_INTERVAL_MS / 1000}s...`,
       });
 
-      await sleep(POLL_INTERVAL_MS, signal);
+      await sleep(jitteredPollInterval(), signal);
     }
 
     if (signal.aborted) return;
@@ -619,10 +623,14 @@ async function runCampsiteSniperJob(job: SniperJob): Promise<void> {
     }
 
     if (job.campgroundIsPermit) {
-      jobLog(job, `Setting group size to ${job.groupSize}...`);
-      await logStepTiming(job, "set group size (pre-warm)", () =>
-        setGroupSize(page, job),
-      );
+      try {
+        jobLog(job, `Attempting to set group size during pre-warm (may not be available yet)...`);
+        await logStepTiming(job, "set group size (pre-warm)", () =>
+          setGroupSize(page, job),
+        );
+      } catch {
+        jobLog(job, "Group size not available during pre-warm (window likely not open yet). Will set during booking.");
+      }
     }
 
     if (signal.aborted) return;
@@ -676,9 +684,9 @@ async function runCampsiteSniperJob(job: SniperJob): Promise<void> {
         }
 
         updateJob(job, {
-          message: `Poll #${job.attempts}: No availability yet. Next check in ${POLL_INTERVAL_MS / 1000}s...`,
+          message: `Poll #${job.attempts}: No availability yet. Retrying...`,
         });
-        await sleep(POLL_INTERVAL_MS, signal);
+        await sleep(jitteredPollInterval(), signal);
       }
 
       if (signal.aborted) return;
@@ -767,9 +775,9 @@ async function runCampsiteSniperJob(job: SniperJob): Promise<void> {
         }
 
         updateJob(job, {
-          message: `Poll #${job.attempts}: No availability yet. Next check in ${POLL_INTERVAL_MS / 1000}s...`,
+          message: `Poll #${job.attempts}: No availability yet. Retrying...`,
         });
-        await sleep(POLL_INTERVAL_MS, signal);
+        await sleep(jitteredPollInterval(), signal);
       }
 
       if (signal.aborted) return;
@@ -1219,8 +1227,48 @@ async function hasAbnormalActivityError(page: Page): Promise<boolean> {
 /**
  * Random delay between min and max ms to mimic human behavior.
  */
-function humanDelay(min = 300, max = 800): number {
+function humanDelay(min = 500, max = 1500): number {
   return Math.floor(Math.random() * (max - min)) + min;
+}
+
+/** Return a jittered poll interval (±30% around POLL_INTERVAL_MS). */
+function jitteredPollInterval(): number {
+  const jitter = POLL_INTERVAL_MS * 0.3;
+  return Math.floor(POLL_INTERVAL_MS + (Math.random() * 2 - 1) * jitter);
+}
+
+/**
+ * Move the mouse to a locator's bounding box with slight randomness,
+ * pause briefly, then click. Mimics a real user moving the cursor to
+ * an element before clicking it.
+ */
+async function humanClick(page: Page, locator: ReturnType<Page["locator"]>, opts?: { timeout?: number }): Promise<void> {
+  const box = await locator.first().boundingBox();
+  if (box) {
+    const x = box.x + box.width * (0.3 + Math.random() * 0.4);
+    const y = box.y + box.height * (0.3 + Math.random() * 0.4);
+    await page.mouse.move(x, y, { steps: 5 + Math.floor(Math.random() * 10) });
+    await page.waitForTimeout(humanDelay(80, 250));
+  }
+  await locator.first().click({ timeout: opts?.timeout ?? 5000 });
+}
+
+/**
+ * Simulate light browsing behavior — scroll down, pause, scroll back.
+ * Makes the session look more natural before interacting with elements.
+ */
+async function simulateBrowsing(page: Page): Promise<void> {
+  const scrollY = 200 + Math.floor(Math.random() * 400);
+  await page.mouse.move(
+    400 + Math.floor(Math.random() * 600),
+    300 + Math.floor(Math.random() * 200),
+    { steps: 8 },
+  );
+  await page.waitForTimeout(humanDelay(300, 800));
+  await page.evaluate(`window.scrollBy({ top: ${scrollY}, behavior: "smooth" })`);
+  await page.waitForTimeout(humanDelay(600, 1200));
+  await page.evaluate(`window.scrollBy({ top: ${-Math.floor(scrollY / 2)}, behavior: "smooth" })`);
+  await page.waitForTimeout(humanDelay(300, 600));
 }
 
 async function debugPageState(
@@ -1402,32 +1450,25 @@ async function setGroupSize(page: Page, job: SniperJob): Promise<void> {
   const plusBtn = page.locator('button[aria-label="Add Peoples"]');
 
   try {
-    // Step 1: Click the trigger to open the dropdown
     jobLog(job, "Step 1: Opening group members dropdown...");
     const trigger = page.locator("button#guest-counter-QuotaUsageByMemberDaily");
     await trigger.waitFor({ timeout: 10000 });
-    await trigger.click();
+    await humanClick(page, trigger);
 
-    // Wait for the CONTENT to render inside the popup (not just the popup div,
-    // which exists empty in the DOM before opening). Wait for the input element.
     jobLog(job, "Waiting for popup content to render...");
     await peopleInput.waitFor({ state: "visible", timeout: 10000 });
     jobLog(job, "Dropdown content visible.");
 
-    // Step 2: Read current value from the input
     const currentValStr = await peopleInput.inputValue();
     const currentVal = parseInt(currentValStr, 10) || 0;
     jobLog(job, `Current people count: ${currentVal}, target: ${size}`);
 
-    // Step 3: Click the "Add Peoples" (+) button to reach the target
-    // Don't use fill() -- React controlled inputs ignore synthetic value changes.
-    // The + button is the only reliable way to change the value.
     const clicksNeeded = Math.max(0, size - currentVal);
     jobLog(job, `Clicking "Add Peoples" button ${clicksNeeded} times...`);
 
     for (let i = 0; i < clicksNeeded; i++) {
-      await plusBtn.click({ timeout: 3000 });
-      await page.waitForTimeout(200);
+      await humanClick(page, plusBtn, { timeout: 3000 });
+      await page.waitForTimeout(humanDelay(150, 400));
     }
 
     // Verify the value changed
@@ -1437,13 +1478,13 @@ async function setGroupSize(page: Page, job: SniperJob): Promise<void> {
 
     await saveScreenshot(page, job, "group-size-set");
 
-    // Step 4: Close the dropdown
     jobLog(job, "Step 4: Closing dropdown...");
     const closeBtn = page.locator(
       '.sarsa-dropdown-base-popup-actions button:has-text("Close")',
     );
     try {
-      await closeBtn.click({ timeout: 3000 });
+      await page.waitForTimeout(humanDelay(300, 700));
+      await humanClick(page, closeBtn, { timeout: 3000 });
       jobLog(job, "Clicked Close button.");
     } catch {
       jobLog(job, "Close button not found, pressing Escape...");
@@ -1483,9 +1524,10 @@ async function attemptBrowserBooking(
     jobLog(job, "Navigating to:", url);
     await logStepTiming(job, "goto booking page + hydrate", async () => {
       await safeGoto(page, job, url, "booking-page-loaded-nav");
-      await page.waitForTimeout(1500);
+      await page.waitForTimeout(humanDelay(1000, 2000));
     });
 
+    await simulateBrowsing(page);
     await page.waitForTimeout(humanDelay(500, 1200));
 
     await logStepTiming(job, "set group size (booking)", () =>
@@ -1560,11 +1602,11 @@ async function attemptBrowserBooking(
           const trailCount = await trailBtn.count();
           jobLog(job, `  Trailhead "${job.trailheadName}": found ${trailCount} matching button(s)`);
           if (trailCount > 0) {
-            await trailBtn.first().click({ timeout: 5000 });
+            await humanClick(page, trailBtn);
             clickCount++;
             clicked = true;
             jobLog(job, `  Trailhead cell clicked! (${clickCount} total)`);
-            await page.waitForTimeout(humanDelay(200, 500));
+            await page.waitForTimeout(humanDelay(400, 900));
           } else {
             jobLog(job, `  Target trailhead not available for ${nightDate}, falling back to any available...`);
           }
@@ -1578,10 +1620,10 @@ async function attemptBrowserBooking(
           jobLog(job, `  Found ${count} matching button(s)`);
 
           if (count > 0) {
-            await btn.first().click({ timeout: 5000 });
+            await humanClick(page, btn);
             clickCount++;
             jobLog(job, `  Clicked! (${clickCount} total)`);
-            await page.waitForTimeout(humanDelay(200, 500));
+            await page.waitForTimeout(humanDelay(400, 900));
           } else {
             const fallback = page.locator(
               `button[aria-label*="${ariaDateStr}"]:not([disabled])`,
@@ -1589,10 +1631,10 @@ async function attemptBrowserBooking(
             const fbCount = await fallback.count();
             jobLog(job, `  Fallback: found ${fbCount} button(s)`);
             if (fbCount > 0) {
-              await fallback.first().click({ timeout: 5000 });
+              await humanClick(page, fallback);
               clickCount++;
               jobLog(job, `  Fallback clicked! (${clickCount} total)`);
-              await page.waitForTimeout(humanDelay(200, 500));
+              await page.waitForTimeout(humanDelay(400, 900));
             } else {
               jobLog(job, `  No available button found for ${nightDate}`);
             }
@@ -1637,8 +1679,8 @@ async function attemptBrowserBooking(
         const bookCount = await bookBtn.count();
         jobLog(job, `Found ${bookCount} "Book Now" button(s)`);
         if (bookCount > 0) {
-          await page.waitForTimeout(humanDelay(300, 700));
-          await bookBtn.first().click({ timeout: 5000 });
+          await page.waitForTimeout(humanDelay(500, 1200));
+          await humanClick(page, bookBtn);
           jobLog(job, "Clicked Book Now!");
           bookClicked = true;
         }
@@ -1653,8 +1695,8 @@ async function attemptBrowserBooking(
             const btn = page.locator(`button:has-text("${label}")`);
             if ((await btn.count()) > 0) {
               jobLog(job, `Clicking fallback: "${label}"`);
-              await page.waitForTimeout(humanDelay(300, 600));
-              await btn.first().click({ timeout: 3000 });
+              await page.waitForTimeout(humanDelay(500, 1000));
+              await humanClick(page, btn, { timeout: 3000 });
               bookClicked = true;
               break;
             }
@@ -1806,50 +1848,49 @@ async function fillOrderDetails(page: Page, job: SniperJob): Promise<boolean> {
     await page.locator("input#address1").waitFor({ state: "visible", timeout: 15000 });
     jobLog(job, "Order details form loaded.");
 
-    // Fill country (select)
     jobLog(job, `Setting country to ${country}...`);
     await page.locator("select#country").selectOption(country);
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(humanDelay(300, 600));
 
-    // Fill address
-    jobLog(job, `Setting address to "${address}"...`);
-    await page.locator("input#address1").fill(address);
+    const addressInput = page.locator("input#address1");
+    await humanClick(page, addressInput);
+    await addressInput.fill(address);
+    await page.waitForTimeout(humanDelay(300, 700));
 
-    // Fill city
-    jobLog(job, `Setting city to "${city}"...`);
-    await page.locator("input#city").fill(city);
+    const cityInput = page.locator("input#city");
+    await humanClick(page, cityInput);
+    await cityInput.fill(city);
+    await page.waitForTimeout(humanDelay(300, 600));
 
-    // Fill state (select) -- wait for state dropdown to populate after country selection
     jobLog(job, `Setting state to ${state}...`);
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(humanDelay(200, 500));
     await page.locator("select#state").selectOption(state);
+    await page.waitForTimeout(humanDelay(300, 600));
 
-    // Fill zip
-    jobLog(job, `Setting zip to "${zip}"...`);
-    await page.locator("input#zip_code").fill(zip);
+    const zipInput = page.locator("input#zip_code");
+    await humanClick(page, zipInput);
+    await zipInput.fill(zip);
 
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(humanDelay(400, 800));
     await saveScreenshot(page, job, "order-details-filled");
 
-    // Check the "Need to Know" terms checkbox
     jobLog(job, "Checking terms checkbox...");
     const checkbox = page.locator("input#need-to-know-checkbox");
     const isChecked = await checkbox.isChecked();
     if (!isChecked) {
-      // Click the label since the input is hidden (rec-input-hide class)
-      await page.locator('label[for="need-to-know-checkbox"]').click();
+      const termsLabel = page.locator('label[for="need-to-know-checkbox"]');
+      await humanClick(page, termsLabel);
       jobLog(job, "Terms checkbox checked.");
     } else {
       jobLog(job, "Terms checkbox already checked.");
     }
 
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(humanDelay(500, 1000));
 
-    // Click "Proceed to Cart"
     jobLog(job, 'Clicking "Proceed to Cart"...');
     const cartBtn = page.locator('button[data-testid="OrderDetailsSummary-cart-btn"]');
     await cartBtn.waitFor({ timeout: 5000 });
-    await cartBtn.click();
+    await humanClick(page, cartBtn);
     jobLog(job, "Clicked Proceed to Cart!");
 
     await page.waitForTimeout(3000);
@@ -2063,7 +2104,31 @@ async function signIn(
 ): Promise<void> {
   console.log("[sniper] Signing in...");
 
+  // Visit homepage first to warm cookies/session like a real user
   const maxRetries = 3;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      await page.goto("https://www.recreation.gov/", {
+        waitUntil: "domcontentloaded",
+        timeout: 60000,
+      });
+      break;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (attempt < maxRetries && (msg.includes("ERR_HTTP_RESPONSE_CODE_FAILURE") || msg.includes("ERR_TIMED_OUT") || msg.includes("ERR_CONNECTION"))) {
+        console.log(`[sniper] Homepage load failed (attempt ${attempt}/${maxRetries}): ${msg.slice(0, 100)}. Retrying in ${attempt * 3}s...`);
+        await page.waitForTimeout(attempt * 3000);
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  await page.waitForTimeout(humanDelay(1500, 3000));
+  await dismissOutdatedBrowserBanner(page);
+  await simulateBrowsing(page);
+
+  // Navigate to login page
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       await page.goto("https://www.recreation.gov/log-in", {
@@ -2082,25 +2147,27 @@ async function signIn(
     }
   }
 
-  await page.waitForTimeout(1500);
+  await page.waitForTimeout(humanDelay(1000, 2000));
   await dismissOutdatedBrowserBanner(page);
-
-  // Exact selectors from recreation.gov DOM:
-  //   Email:    input#email (type="email")
-  //   Password: input#rec-acct-sign-in-password (type="password")
-  //   Submit:   button.rec-acct-sign-in-btn (type="submit", text "Log In")
 
   const emailInput = page.locator("input#email");
   await emailInput.waitFor({ timeout: 10000 });
+  await page.waitForTimeout(humanDelay(400, 900));
+  await humanClick(page, emailInput);
   await emailInput.fill(email);
+
+  await page.waitForTimeout(humanDelay(500, 1000));
 
   const passwordInput = page.locator("input#rec-acct-sign-in-password");
   await passwordInput.waitFor({ timeout: 5000 });
+  await humanClick(page, passwordInput);
   await passwordInput.fill(password);
+
+  await page.waitForTimeout(humanDelay(600, 1200));
 
   const submitBtn = page.locator("button.rec-acct-sign-in-btn");
   await submitBtn.waitFor({ timeout: 5000 });
-  await submitBtn.click();
+  await humanClick(page, submitBtn);
 
   // Wait for navigation away from log-in page
   try {
@@ -2108,7 +2175,7 @@ async function signIn(
       (url) => !url.pathname.includes("log-in"),
       { timeout: 15000 },
     );
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(humanDelay(1000, 2000));
   } catch {
     if (page.url().includes("log-in")) {
       throw new Error("Login failed. Check your recreation.gov credentials.");
