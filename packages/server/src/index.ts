@@ -30,6 +30,32 @@ app.get("/api/health", (_req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
+// Serve screenshots for debugging (list + individual files)
+const screenshotsDir = path.join(
+  process.env.DATA_DIR || path.resolve(__dirname, "../../../data"),
+  "screenshots",
+);
+
+app.get("/api/screenshots", async (_req, res) => {
+  try {
+    const files = await fs.promises.readdir(screenshotsDir);
+    const pngs = files.filter((f) => f.endsWith(".png")).sort().reverse();
+    res.json({ screenshots: pngs });
+  } catch {
+    res.json({ screenshots: [] });
+  }
+});
+
+app.get("/api/screenshots/:filename", (req, res) => {
+  const filename = path.basename(req.params.filename);
+  const filepath = path.join(screenshotsDir, filename);
+  if (!fs.existsSync(filepath)) {
+    res.status(404).json({ error: "Screenshot not found" });
+    return;
+  }
+  res.sendFile(filepath);
+});
+
 // In production, serve the built client static files
 const clientDistPath = process.env.CLIENT_DIST_PATH
   || path.resolve(__dirname, "../../client/dist");

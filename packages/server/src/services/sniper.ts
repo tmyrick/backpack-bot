@@ -1131,6 +1131,21 @@ async function saveScreenshot(
   }
 }
 
+/**
+ * Dismiss the "outdated browser" banner that recreation.gov shows for Playwright browsers.
+ * Clicks the "Ignore" button if present.
+ */
+async function dismissOutdatedBrowserBanner(page: Page): Promise<void> {
+  try {
+    const ignoreBtn = page.locator('button:has-text("Ignore")');
+    if (await ignoreBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
+      await ignoreBtn.click();
+    }
+  } catch {
+    // Banner not present, that's fine
+  }
+}
+
 async function debugPageState(
   page: Page,
   job: SniperJob,
@@ -1221,6 +1236,7 @@ async function safeGoto(
 ): Promise<{ is404: boolean }> {
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(1500);
+  await dismissOutdatedBrowserBanner(page);
   await dismissTrafficModal(page, job);
 
   const pageCheck = await page.evaluate(() => {
@@ -1795,7 +1811,8 @@ async function signIn(
     waitUntil: "domcontentloaded",
     timeout: 60000,
   });
-  await page.waitForTimeout(1500); // let the login form render
+  await page.waitForTimeout(1500);
+  await dismissOutdatedBrowserBanner(page);
 
   // Exact selectors from recreation.gov DOM:
   //   Email:    input#email (type="email")

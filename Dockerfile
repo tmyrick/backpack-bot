@@ -31,9 +31,9 @@ COPY packages/server/package.json packages/server/
 COPY packages/client/package.json packages/client/
 RUN npm ci --omit=dev
 
-# Install Playwright Chromium AND its system dependencies in one command.
-# --with-deps handles apt package installation for whatever Debian/Ubuntu base we're on.
-RUN npx -w packages/server playwright install --with-deps chromium
+# Install real Google Chrome (not Playwright's Chromium) + Playwright system deps.
+# Real Chrome is harder for bot detection to fingerprint.
+RUN npx -w packages/server playwright install --with-deps chrome
 
 # Copy built artifacts from build stage
 COPY --from=build /app/packages/server/dist packages/server/dist
