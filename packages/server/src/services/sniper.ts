@@ -30,7 +30,7 @@ const SCREENSHOTS_DIR = path.join(DATA_DIR, "screenshots");
 
 const PRE_WARM_LEAD_MS = 2 * 60 * 1000; // 2 minutes before window
 const POLL_INTERVAL_MS = 1_000; // 1 second — faster detection when window opens
-const MAX_WATCH_DURATION_MS = 5 * 60 * 1000; // 5 minutes of watching
+const MAX_WATCH_DURATION_MS = 60 * 1000; // 60 seconds of polling
 const RECGOV_API = "https://www.recreation.gov/api/permits";
 
 const WINDOWS_CHROME_UA =
