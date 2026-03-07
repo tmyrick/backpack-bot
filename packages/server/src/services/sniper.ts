@@ -38,19 +38,23 @@ const WINDOWS_CHROME_UA =
 
 /**
  * Launch a browser + context with stealth settings to avoid bot detection.
- * Uses the system Chrome install (channel: "chrome") instead of bundled Chromium,
- * hides navigator.webdriver, and sets realistic viewport/locale/timezone.
+ * Tries system Chrome first, falls back to bundled Chromium if unavailable.
  */
 async function launchStealthBrowser(): Promise<{ browser: Browser; context: BrowserContext; page: Page }> {
-  const browser = await chromium.launch({
-    headless: true,
-    channel: "chrome",
-    args: [
-      "--disable-blink-features=AutomationControlled",
-      "--disable-features=IsolateOrigins,site-per-process",
-      "--no-sandbox",
-    ],
-  });
+  const launchArgs = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--no-sandbox",
+  ];
+
+  let browser: Browser;
+  try {
+    browser = await chromium.launch({ headless: true, channel: "chrome", args: launchArgs });
+    console.log("[sniper] Launched system Chrome");
+  } catch {
+    browser = await chromium.launch({ headless: true, args: launchArgs });
+    console.log("[sniper] System Chrome not found, using bundled Chromium");
+  }
 
   const context = await browser.newContext({
     userAgent: WINDOWS_CHROME_UA,
