@@ -1146,6 +1146,23 @@ async function dismissOutdatedBrowserBanner(page: Page): Promise<void> {
   }
 }
 
+/**
+ * Check if the "abnormal activity" error banner is present on the page.
+ */
+async function hasAbnormalActivityError(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const text = document.body?.innerText || "";
+    return text.includes("abnormal activity from your computer network");
+  });
+}
+
+/**
+ * Random delay between min and max ms to mimic human behavior.
+ */
+function humanDelay(min = 300, max = 800): number {
+  return Math.floor(Math.random() * (max - min)) + min;
+}
+
 async function debugPageState(
   page: Page,
   job: SniperJob,
@@ -1380,24 +1397,50 @@ async function attemptBrowserBooking(
       await page.waitForTimeout(1500);
     });
 
+    await page.waitForTimeout(humanDelay(500, 1200));
+
     await logStepTiming(job, "set group size (booking)", () =>
       setGroupSize(page, job),
     );
+
+    await page.waitForTimeout(humanDelay(800, 1500));
+
+    // Check for "abnormal activity" error before proceeding
+    if (await hasAbnormalActivityError(page)) {
+      jobLog(job, "Abnormal activity error detected on booking page. Dismissing and retrying...");
+      await saveScreenshot(page, job, "abnormal-activity-detected");
+      // Try dismissing the error banner
+      try {
+        const closeBtn = page.locator('.rec-alert-dismiss, button[aria-label="Close"], .alert-close');
+        if (await closeBtn.first().isVisible({ timeout: 2000 }).catch(() => false)) {
+          await closeBtn.first().click();
+          await page.waitForTimeout(humanDelay(1000, 2000));
+        }
+      } catch {
+        // Couldn't dismiss, try reloading
+        jobLog(job, "Could not dismiss error. Reloading page...");
+        await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
+        await page.waitForTimeout(humanDelay(2000, 3000));
+        await dismissOutdatedBrowserBanner(page);
+        await setGroupSize(page, job);
+        await page.waitForTimeout(humanDelay(800, 1500));
+      }
+
+      if (await hasAbnormalActivityError(page)) {
+        jobLog(job, "Abnormal activity error persists after retry.");
+        await saveScreenshot(page, job, "abnormal-activity-persistent");
+        return "failed";
+      }
+    }
 
     await debugPageState(page, job, "booking-page-loaded");
 
     const nightDates = expandRange(targetRange);
     jobLog(job, "Night dates to book:", nightDates);
 
-    // Recreation.gov availability grid uses buttons with aria-labels like:
-    //   aria-label="Tilly Jane A-Frame Permit on February 16, 2026 - Available"
-    // Cells are <div data-testid="availability-cell"> containing <button> elements.
-    // Available cells have class "available", unavailable have "unavailable" + disabled.
-
     let clickCount = 0;
 
     for (const nightDate of nightDates) {
-      // Format the date for the aria-label: "February 16, 2026"
       const d = new Date(nightDate + "T00:00:00");
       const monthName = d.toLocaleString("en-US", { month: "long", timeZone: "UTC" });
       const dayOfMonth = d.getUTCDate();
@@ -1406,8 +1449,12 @@ async function attemptBrowserBooking(
 
       jobLog(job, `Looking for button with aria-label containing "${ariaDateStr}" and "Available"...`);
 
+      // Human-like delay between date cell clicks
+      if (clickCount > 0) {
+        await page.waitForTimeout(humanDelay(400, 900));
+      }
+
       try {
-        // Find the available button by its aria-label
         const btn = page.locator(
           `button.rec-availability-date[aria-label*="${ariaDateStr}"][aria-label*="Available"]:not([disabled])`,
         );
@@ -1418,9 +1465,8 @@ async function attemptBrowserBooking(
           await btn.first().click({ timeout: 5000 });
           clickCount++;
           jobLog(job, `  Clicked! (${clickCount} total)`);
-          await page.waitForTimeout(300);
+          await page.waitForTimeout(humanDelay(200, 500));
         } else {
-          // Fallback: try broader selector
           const fallback = page.locator(
             `button[aria-label*="${ariaDateStr}"]:not([disabled])`,
           );
@@ -1430,7 +1476,7 @@ async function attemptBrowserBooking(
             await fallback.first().click({ timeout: 5000 });
             clickCount++;
             jobLog(job, `  Fallback clicked! (${clickCount} total)`);
-            await page.waitForTimeout(300);
+            await page.waitForTimeout(humanDelay(200, 500));
           } else {
             jobLog(job, `  No available button found for ${nightDate}`);
           }
@@ -1449,14 +1495,22 @@ async function attemptBrowserBooking(
       return "failed";
     }
 
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(humanDelay(800, 1500));
     await saveScreenshot(page, job, "after-cell-click");
 
     const clickDatesMs = await logStepTiming(job, "click date cells", async () => {
-      // Already done above; this times the next block which is "Book Now" + wait
       return clickCount;
     });
     void clickDatesMs;
+
+    // Check again for abnormal activity before clicking Book Now
+    if (await hasAbnormalActivityError(page)) {
+      jobLog(job, "Abnormal activity error appeared after selecting dates.");
+      await saveScreenshot(page, job, "abnormal-after-dates");
+      return "failed";
+    }
+
+    await page.waitForTimeout(humanDelay(500, 1000));
 
     jobLog(job, "Looking for Book Now button...");
     let bookClicked = false;
@@ -1466,6 +1520,7 @@ async function attemptBrowserBooking(
         const bookCount = await bookBtn.count();
         jobLog(job, `Found ${bookCount} "Book Now" button(s)`);
         if (bookCount > 0) {
+          await page.waitForTimeout(humanDelay(300, 700));
           await bookBtn.first().click({ timeout: 5000 });
           jobLog(job, "Clicked Book Now!");
           bookClicked = true;
@@ -1481,6 +1536,7 @@ async function attemptBrowserBooking(
             const btn = page.locator(`button:has-text("${label}")`);
             if ((await btn.count()) > 0) {
               jobLog(job, `Clicking fallback: "${label}"`);
+              await page.waitForTimeout(humanDelay(300, 600));
               await btn.first().click({ timeout: 3000 });
               bookClicked = true;
               break;
@@ -1556,6 +1612,13 @@ async function fillOrderDetails(page: Page, job: SniperJob): Promise<boolean> {
   }
 
   try {
+    // Check for abnormal activity error before waiting for form
+    if (await hasAbnormalActivityError(page)) {
+      jobLog(job, "Abnormal activity error detected on order details page.");
+      await saveScreenshot(page, job, "order-details-abnormal-activity");
+      return false;
+    }
+
     // Wait for the order details form to load
     jobLog(job, "Waiting for order details form...");
     await page.locator("input#address1").waitFor({ state: "visible", timeout: 15000 });
