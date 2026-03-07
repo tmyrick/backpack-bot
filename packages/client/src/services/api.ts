@@ -43,6 +43,16 @@ export async function fetchCampsites(campgroundId: string): Promise<CampsiteSumm
   return data.campsites;
 }
 
+export interface StartingAreaInfo {
+  hasStartingAreas: boolean;
+  startingAreas: { name: string; trailheads: { divisionId: string; name: string }[] }[];
+  trailheads?: { divisionId: string; name: string }[];
+}
+
+export async function fetchStartingAreas(permitId: string): Promise<StartingAreaInfo> {
+  return apiFetch<StartingAreaInfo>(`/permits/${permitId}/starting-areas`);
+}
+
 export async function fetchPermitDetail(
   permitId: string,
 ): Promise<PermitDetail> {

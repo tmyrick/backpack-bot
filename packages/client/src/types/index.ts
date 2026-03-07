@@ -139,6 +139,9 @@ export interface SniperJob {
   permitId: string;
   permitName: string;
   divisionId: string;
+  // Trail permit fields (starting-area permits)
+  startingArea: string;
+  trailheadName: string;
   // Campsite fields
   campgroundId: string;
   campgroundName: string;
@@ -163,6 +166,9 @@ export interface SniperJobRequest {
   permitId?: string;
   permitName?: string;
   divisionId?: string;
+  // Trail permit fields (starting-area permits)
+  startingArea?: string;
+  trailheadName?: string;
   // Campsite fields
   campgroundId?: string;
   campgroundName?: string;

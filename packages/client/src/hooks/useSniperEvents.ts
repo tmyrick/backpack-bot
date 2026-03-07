@@ -43,6 +43,14 @@ export function useSniperEvents() {
     };
   }, []);
 
+  const removeJob = useCallback((id: string) => {
+    setJobs((prev) => {
+      const next = new Map(prev);
+      next.delete(id);
+      return next;
+    });
+  }, []);
+
   const refresh = useCallback(async () => {
     try {
       const res = await fetch("/api/sniper");
@@ -65,5 +73,6 @@ export function useSniperEvents() {
     jobs: Array.from(jobs.values()),
     connected,
     refresh,
+    removeJob,
   };
 }

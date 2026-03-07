@@ -6,7 +6,9 @@ import {
   fetchPermits,
   fetchCampgrounds,
   fetchCampsites,
+  fetchStartingAreas,
 } from "../services/api";
+import type { StartingAreaInfo } from "../services/api";
 import { useSniperEvents } from "../hooks/useSniperEvents";
 import SearchableSelect from "../components/SearchableSelect";
 import type { SniperJob, SniperStatus, BookingType, PermitSummary, CampgroundSummary, CampsiteSummary, DateRange } from "../types/index";
@@ -74,7 +76,7 @@ function formatCountdown(isoDate: string): string {
 // ---- Main page ----
 
 export default function SniperPage() {
-  const { jobs, connected } = useSniperEvents();
+  const { jobs, connected, removeJob } = useSniperEvents();
   const [searchParams] = useSearchParams();
 
   return (
@@ -124,7 +126,7 @@ export default function SniperPage() {
                   new Date(a.createdAt).getTime(),
               )
               .map((job) => (
-                <SniperJobCard key={job.id} job={job} />
+                <SniperJobCard key={job.id} job={job} onRemoved={removeJob} />
               ))}
           </div>
         )}
@@ -159,6 +161,13 @@ function SniperForm({
   const [loadingPermits, setLoadingPermits] = useState(false);
   const [divisions, setDivisions] = useState<{ id: string; name: string }[]>([]);
   const [loadingDivisions, setLoadingDivisions] = useState(false);
+
+  // ---- Trail permit (starting area) fields ----
+  const [startingAreaInfo, setStartingAreaInfo] = useState<StartingAreaInfo | null>(null);
+  const [loadingStartingAreas, setLoadingStartingAreas] = useState(false);
+  const [startingArea, setStartingArea] = useState("");
+  const [trailheadName, setTrailheadName] = useState("");
+  const [trailheadDivisionId, setTrailheadDivisionId] = useState("");
 
   // ---- Campsite fields ----
   const [campgroundId, setCampgroundId] = useState("");
@@ -249,6 +258,16 @@ function SniperForm({
   useEffect(() => {
     if (permitId) {
       loadDivisions(permitId);
+
+      setLoadingStartingAreas(true);
+      setStartingAreaInfo(null);
+      setStartingArea("");
+      setTrailheadName("");
+      setTrailheadDivisionId("");
+      fetchStartingAreas(permitId)
+        .then((info) => setStartingAreaInfo(info))
+        .catch(() => setStartingAreaInfo(null))
+        .finally(() => setLoadingStartingAreas(false));
     }
   }, [permitId, loadDivisions]);
 
@@ -279,6 +298,21 @@ function SniperForm({
     [divisions],
   );
 
+  const startingAreaOptions = useMemo(
+    () =>
+      startingAreaInfo?.hasStartingAreas
+        ? startingAreaInfo.startingAreas.map((a) => ({ value: a.name, label: a.name }))
+        : [],
+    [startingAreaInfo],
+  );
+
+  const trailheadOptions = useMemo(() => {
+    if (!startingAreaInfo?.hasStartingAreas || !startingArea) return [];
+    const area = startingAreaInfo.startingAreas.find((a) => a.name === startingArea);
+    if (!area) return [];
+    return area.trailheads.map((t) => ({ value: t.divisionId, label: t.name }));
+  }, [startingAreaInfo, startingArea]);
+
   const campgroundOptions = useMemo(
     () =>
       [...campgrounds]
@@ -305,6 +339,27 @@ function SniperForm({
     const match = permits.find((p) => p.facilityId === fid);
     setPermitName(match?.name || "");
     setDivisionId("");
+    setStartingArea("");
+    setTrailheadName("");
+    setTrailheadDivisionId("");
+  };
+
+  const handleStartingAreaChange = (area: string) => {
+    setStartingArea(area);
+    setTrailheadName("");
+    setTrailheadDivisionId("");
+  };
+
+  const handleTrailheadChange = (divId: string) => {
+    setTrailheadDivisionId(divId);
+    if (!divId) {
+      setTrailheadName("");
+      return;
+    }
+    if (!startingAreaInfo?.hasStartingAreas) return;
+    const area = startingAreaInfo.startingAreas.find((a) => a.name === startingArea);
+    const trailhead = area?.trailheads.find((t) => t.divisionId === divId);
+    setTrailheadName(trailhead?.name || "");
   };
 
   const handleCampgroundChange = (fid: string) => {
@@ -370,7 +425,11 @@ function SniperForm({
     }
     if (bookingType === "permit") {
       if (!permitId) { setError("Select a permit."); return; }
-      if (!divisionId) { setError("Select a division/entrance."); return; }
+      if (startingAreaInfo?.hasStartingAreas) {
+        if (!startingArea) { setError("Select a starting area."); return; }
+      } else {
+        if (!divisionId) { setError("Select a division/entrance."); return; }
+      }
     } else {
       if (!campgroundId) { setError("Select a campground."); return; }
     }
@@ -381,10 +440,20 @@ function SniperForm({
 
     setSubmitting(true);
     try {
+      const permitPayload = startingAreaInfo?.hasStartingAreas
+        ? {
+            permitId,
+            permitName,
+            divisionId: trailheadDivisionId || undefined,
+            startingArea,
+            trailheadName: trailheadName || undefined,
+          }
+        : { permitId, permitName, divisionId };
+
       const job = await createSniperJob({
         bookingType,
         ...(bookingType === "permit"
-          ? { permitId, permitName, divisionId }
+          ? permitPayload
           : { campgroundId, campgroundName, campgroundIsPermit, campsiteId: campsiteId || undefined }),
         desiredDateRanges: filteredRanges,
         groupSize,
@@ -449,48 +518,85 @@ function SniperForm({
 
       {/* Permit selection */}
       {bookingType === "permit" && (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <label className="block text-sm font-medium text-stone-300 mb-1">
-              Permit
-            </label>
-            <SearchableSelect
-              options={permitOptions}
-              value={permitId}
-              onChange={handlePermitChange}
-              placeholder="Select a permit..."
-              loading={loadingPermits}
-              loadingText="Loading permits..."
-            />
-            {permitId && (
-              <p className="mt-1 text-xs text-stone-500">ID: {permitId}</p>
+        <>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-stone-300 mb-1">
+                Permit
+              </label>
+              <SearchableSelect
+                options={permitOptions}
+                value={permitId}
+                onChange={handlePermitChange}
+                placeholder="Select a permit..."
+                loading={loadingPermits}
+                loadingText="Loading permits..."
+              />
+              {permitId && (
+                <p className="mt-1 text-xs text-stone-500">ID: {permitId}</p>
+              )}
+            </div>
+
+            {permitId && !loadingStartingAreas && startingAreaInfo?.hasStartingAreas ? (
+              <>
+                <div>
+                  <label className="block text-sm font-medium text-stone-300 mb-1">
+                    Starting Area
+                  </label>
+                  <SearchableSelect
+                    options={startingAreaOptions}
+                    value={startingArea}
+                    onChange={handleStartingAreaChange}
+                    placeholder="Select a starting area..."
+                  />
+                </div>
+              </>
+            ) : (
+              <div>
+                <label className="block text-sm font-medium text-stone-300 mb-1">
+                  Division / Entrance
+                </label>
+                <SearchableSelect
+                  options={divisionOptions}
+                  value={divisionId}
+                  onChange={setDivisionId}
+                  placeholder={!permitId ? "Select a permit first" : "Select a division..."}
+                  disabled={!permitId}
+                  loading={loadingDivisions || loadingStartingAreas}
+                  loadingText="Loading..."
+                />
+                {permitId && divisions.length === 0 && !loadingDivisions && (
+                  <input
+                    type="text"
+                    placeholder="Division ID"
+                    value={divisionId}
+                    onChange={(e) => setDivisionId(e.target.value)}
+                    className={`mt-1 ${inputClasses} text-sm placeholder-stone-500`}
+                  />
+                )}
+              </div>
             )}
           </div>
 
-          <div>
-            <label className="block text-sm font-medium text-stone-300 mb-1">
-              Division / Entrance
-            </label>
-            <SearchableSelect
-              options={divisionOptions}
-              value={divisionId}
-              onChange={setDivisionId}
-              placeholder={!permitId ? "Select a permit first" : "Select a division..."}
-              disabled={!permitId}
-              loading={loadingDivisions}
-              loadingText="Loading..."
-            />
-            {permitId && divisions.length === 0 && !loadingDivisions && (
-              <input
-                type="text"
-                placeholder="Division ID"
-                value={divisionId}
-                onChange={(e) => setDivisionId(e.target.value)}
-                className={`mt-1 ${inputClasses} text-sm placeholder-stone-500`}
-              />
-            )}
-          </div>
-        </div>
+          {permitId && startingAreaInfo?.hasStartingAreas && startingArea && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-stone-300 mb-1">
+                  Trailhead (optional)
+                </label>
+                <SearchableSelect
+                  options={trailheadOptions}
+                  value={trailheadDivisionId}
+                  onChange={handleTrailheadChange}
+                  placeholder="Any available trailhead"
+                />
+                <p className="mt-1 text-xs text-stone-500">
+                  Leave empty to book any available trailhead in this starting area.
+                </p>
+              </div>
+            </div>
+          )}
+        </>
       )}
 
       {/* Campsite selection */}
@@ -751,7 +857,7 @@ function SniperForm({
 
 // ---- Job Card ----
 
-function SniperJobCard({ job }: { job: SniperJob }) {
+function SniperJobCard({ job, onRemoved }: { job: SniperJob; onRemoved: (id: string) => void }) {
   const [deleting, setDeleting] = useState(false);
   const [countdown, setCountdown] = useState(
     formatCountdown(job.windowOpensAt),
@@ -782,6 +888,7 @@ function SniperJobCard({ job }: { job: SniperJob }) {
     setDeleting(true);
     try {
       await deleteSniperJob(job.id);
+      onRemoved(job.id);
     } catch {
       /* ignore */
     } finally {
@@ -812,7 +919,9 @@ function SniperJobCard({ job }: { job: SniperJob }) {
               Job {job.id.slice(0, 8)} &middot;{" "}
               {job.bookingType === "campsite"
                 ? (job.campsiteId ? `Site ${job.campsiteId}` : "Any site")
-                : `Division ${job.divisionId}`}
+                : job.startingArea
+                  ? `${job.startingArea}${job.trailheadName ? ` > ${job.trailheadName}` : " > Any trailhead"}`
+                  : `Division ${job.divisionId}`}
               <span className="ml-1.5 px-1.5 py-0.5 rounded bg-stone-700 text-stone-400">
                 {job.bookingType === "campsite" ? "Campsite" : "Permit"}
               </span>

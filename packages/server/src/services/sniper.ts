@@ -39,6 +39,7 @@ const WINDOWS_CHROME_UA =
 /**
  * Launch a browser + context with stealth settings to avoid bot detection.
  * Tries system Chrome first, falls back to bundled Chromium if unavailable.
+ * Supports optional proxy via PROXY_SERVER env var (e.g. "http://user:pass@host:port").
  */
 async function launchStealthBrowser(): Promise<{ browser: Browser; context: BrowserContext; page: Page }> {
   const launchArgs = [
@@ -47,22 +48,53 @@ async function launchStealthBrowser(): Promise<{ browser: Browser; context: Brow
     "--no-sandbox",
   ];
 
-  let browser: Browser;
-  try {
-    browser = await chromium.launch({ headless: true, channel: "chrome", args: launchArgs });
-    console.log("[sniper] Launched system Chrome");
-  } catch {
-    browser = await chromium.launch({ headless: true, args: launchArgs });
-    console.log("[sniper] System Chrome not found, using bundled Chromium");
+  const proxyServer = process.env.PROXY_SERVER;
+  let proxyConfig: { server: string; username?: string; password?: string } | undefined;
+  if (proxyServer) {
+    try {
+      const url = new URL(proxyServer);
+      let username = decodeURIComponent(url.username);
+      // BrightData: append a sticky session ID so the same residential IP
+      // is used for all requests in this browser session.
+      if (username && !username.includes("-session-")) {
+        username += `-session-${crypto.randomUUID().slice(0, 8)}`;
+      }
+      proxyConfig = {
+        server: `${url.protocol}//${url.hostname}:${url.port}`,
+        ...(username ? { username } : {}),
+        ...(url.password ? { password: decodeURIComponent(url.password) } : {}),
+      };
+      console.log(`[sniper] Proxy session: ${username.split("-session-")[1] || "none"}`);
+    } catch {
+      proxyConfig = { server: proxyServer };
+    }
   }
 
-  const context = await browser.newContext({
+  const launchOpts: Parameters<typeof chromium.launch>[0] = {
+    headless: true,
+    args: launchArgs,
+    ...(proxyConfig ? { proxy: proxyConfig } : {}),
+  };
+
+  let browser: Browser;
+  try {
+    browser = await chromium.launch({ ...launchOpts, channel: "chrome" });
+    console.log("[sniper] Launched system Chrome" + (proxyServer ? ` via proxy` : ""));
+  } catch {
+    browser = await chromium.launch(launchOpts);
+    console.log("[sniper] System Chrome not found, using bundled Chromium" + (proxyServer ? ` via proxy` : ""));
+  }
+
+  const contextOpts: Parameters<typeof browser.newContext>[0] = {
     userAgent: WINDOWS_CHROME_UA,
     viewport: { width: 1920, height: 1080 },
     locale: "en-US",
     timezoneId: "America/Los_Angeles",
     permissions: ["geolocation"],
-  });
+    ignoreHTTPSErrors: !!proxyServer,
+  };
+
+  const context = await browser.newContext(contextOpts);
 
   // Remove navigator.webdriver flag before any page loads
   await context.addInitScript(() => {
@@ -157,6 +189,8 @@ export async function createJob(req: SniperJobRequest): Promise<SniperJob> {
     permitId: req.permitId || "",
     permitName: req.permitName || "",
     divisionId: req.divisionId || "",
+    startingArea: req.startingArea || "",
+    trailheadName: req.trailheadName || "",
     campgroundId: req.campgroundId || "",
     campgroundName: req.campgroundName || "",
     campgroundIsPermit: req.campgroundIsPermit || false,
@@ -384,6 +418,12 @@ async function runPermitSniperJob(job: SniperJob): Promise<void> {
       setGroupSize(page, job),
     );
 
+    if (job.startingArea) {
+      await logStepTiming(job, "click starting area filter (pre-warm)", () =>
+        clickStartingAreaFilter(page, job),
+      );
+    }
+
     // Wait until window opens
     const windowTime = new Date(job.windowOpensAt).getTime();
     const waitMs = windowTime - Date.now();
@@ -409,11 +449,30 @@ async function runPermitSniperJob(job: SniperJob): Promise<void> {
     while (!signal.aborted && Date.now() < watchDeadline) {
       job.attempts++;
       try {
-        foundRange = await checkAvailability(
-          job.permitId,
-          job.divisionId,
-          job.desiredDateRanges,
-        );
+        if (job.startingArea && !job.divisionId) {
+          foundRange = await checkPermitFacilityAvailability(
+            job.permitId,
+            job.desiredDateRanges,
+          );
+        } else if (job.startingArea && job.divisionId) {
+          foundRange = await checkAvailability(
+            job.permitId,
+            job.divisionId,
+            job.desiredDateRanges,
+          );
+          if (!foundRange) {
+            foundRange = await checkPermitFacilityAvailability(
+              job.permitId,
+              job.desiredDateRanges,
+            );
+          }
+        } else {
+          foundRange = await checkAvailability(
+            job.permitId,
+            job.divisionId,
+            job.desiredDateRanges,
+          );
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : "unknown error";
         updateJob(job, {
@@ -472,11 +531,15 @@ async function runPermitSniperJob(job: SniperJob): Promise<void> {
     for (const fallbackRange of remainingRanges) {
       if (signal.aborted) return;
 
-      const available = await checkAvailability(
-        job.permitId,
-        job.divisionId,
-        [fallbackRange],
-      );
+      let available: DateRange | null = null;
+      if (job.startingArea && !job.divisionId) {
+        available = await checkPermitFacilityAvailability(job.permitId, [fallbackRange]);
+      } else {
+        available = await checkAvailability(job.permitId, job.divisionId, [fallbackRange]);
+        if (!available && job.startingArea) {
+          available = await checkPermitFacilityAvailability(job.permitId, [fallbackRange]);
+        }
+      }
       if (!available) continue;
 
       updateJob(job, {
@@ -1135,6 +1198,74 @@ async function saveScreenshot(
  * Dismiss the "outdated browser" banner that recreation.gov shows for Playwright browsers.
  * Clicks the "Ignore" button if present.
  */
+/**
+ * Detect and handle a login modal that recreation.gov shows when
+ * the session expires or a booking action requires re-authentication.
+ */
+async function handleLoginModal(page: Page, job: SniperJob): Promise<void> {
+  const loginModal = page.locator('input#email, input[type="email"]').first();
+  const isLoginVisible = await loginModal.isVisible({ timeout: 2000 }).catch(() => false);
+
+  if (!isLoginVisible) return;
+
+  // Check if this is actually a login form (has password field too)
+  const hasPassword = await page.locator('input#rec-acct-sign-in-password, input[type="password"]')
+    .first().isVisible().catch(() => false);
+  if (!hasPassword) return;
+
+  jobLog(job, "Login modal detected after booking action. Re-authenticating...");
+  await saveScreenshot(page, job, "login-modal-detected");
+
+  // #region agent log
+  const btnInfo = await page.evaluate(() => { const allBtns = Array.from(document.querySelectorAll('button')); const loginBtns = allBtns.filter(b => b.textContent?.toLowerCase().includes('log in') || b.textContent?.toLowerCase().includes('sign in')); const modalContent = document.querySelector('.ReactModal__Content'); const modalBtns = modalContent ? Array.from(modalContent.querySelectorAll('button')).map(b => ({ text: b.textContent?.trim(), classes: b.className, id: b.id })) : []; const recAcctBtn = document.querySelector('button.rec-acct-sign-in-btn'); return { loginBtns: loginBtns.map(b => ({ text: b.textContent?.trim(), id: b.id, classes: b.className })), modalBtns, hasRecAcctBtn: !!recAcctBtn, recAcctBtnVisible: recAcctBtn ? getComputedStyle(recAcctBtn).display !== 'none' : false, hasBuorg: !!document.getElementById('buorg') }; });
+  fetch('http://127.0.0.1:7652/ingest/7cc9222c-5337-4c71-9605-a392db73bbc9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'e44772'},body:JSON.stringify({sessionId:'e44772',location:'sniper.ts:handleLoginModal',message:'modal button analysis',data:btnInfo,timestamp:Date.now(),hypothesisId:'A,C'})}).catch(()=>{});
+  // #endregion
+
+  await dismissOutdatedBrowserBanner(page);
+
+  const creds = getRecgovCredentials();
+
+  try {
+    await page.locator('input#email, input[type="email"]').first().fill(creds.email);
+    await page.waitForTimeout(humanDelay(300, 600));
+    await page.locator('input#rec-acct-sign-in-password, input[type="password"]').first().fill(creds.password);
+    await page.waitForTimeout(humanDelay(300, 600));
+
+    // #region agent log
+    fetch('http://127.0.0.1:7652/ingest/7cc9222c-5337-4c71-9605-a392db73bbc9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'e44772'},body:JSON.stringify({sessionId:'e44772',location:'sniper.ts:handleLoginModal:beforeClick',message:'about to click login btn',data:{selector:'button.rec-acct-sign-in-btn'},timestamp:Date.now(),hypothesisId:'A'})}).catch(()=>{});
+    // #endregion
+
+    const recAcctBtn = page.locator('button.rec-acct-sign-in-btn');
+    const hasRecAcct = await recAcctBtn.isVisible({ timeout: 2000 }).catch(() => false);
+
+    if (hasRecAcct) {
+      await recAcctBtn.click({ timeout: 5000 });
+    } else {
+      const modalLoginBtn = page.locator('.ReactModal__Content button:has-text("Log In")');
+      const hasModalBtn = await modalLoginBtn.isVisible({ timeout: 2000 }).catch(() => false);
+      if (hasModalBtn) {
+        await modalLoginBtn.click({ timeout: 5000 });
+      } else {
+        const loginBtn = page.locator('button[type="submit"]:has-text("Log In")');
+        await loginBtn.first().click({ timeout: 5000 });
+      }
+    }
+
+    // #region agent log
+    fetch('http://127.0.0.1:7652/ingest/7cc9222c-5337-4c71-9605-a392db73bbc9',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'e44772'},body:JSON.stringify({sessionId:'e44772',location:'sniper.ts:handleLoginModal:afterClick',message:'login btn clicked successfully',data:{usedRecAcct:hasRecAcct},timestamp:Date.now(),hypothesisId:'A,C'})}).catch(()=>{});
+    // #endregion
+
+    // Wait for the modal to close and page to update
+    await page.waitForTimeout(3000);
+    jobLog(job, "Re-authentication complete. URL:", page.url());
+    await saveScreenshot(page, job, "after-reauth");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    jobLog(job, "Re-authentication failed:", msg);
+    await saveScreenshot(page, job, "reauth-failed");
+  }
+}
+
 async function dismissOutdatedBrowserBanner(page: Page): Promise<void> {
   try {
     const ignoreBtn = page.locator('button:has-text("Ignore")');
@@ -1281,6 +1412,35 @@ async function safeGoto(
   return { is404: isPageBroken };
 }
 
+// ---- Starting area filter (trail overnight permits) ----
+
+async function clickStartingAreaFilter(page: Page, job: SniperJob): Promise<void> {
+  if (!job.startingArea) return;
+
+  jobLog(job, `Clicking starting area filter: "${job.startingArea}"...`);
+
+  const filterBtn = page.locator(
+    `button.olympic-filter-button:has-text("${job.startingArea}")`,
+  );
+  const isVisible = await filterBtn.isVisible({ timeout: 3000 }).catch(() => false);
+
+  if (!isVisible) {
+    jobLog(job, `Starting area button "${job.startingArea}" not found — permit may not have starting areas.`);
+    return;
+  }
+
+  const isPressed = await filterBtn.getAttribute("aria-pressed");
+  if (isPressed === "true") {
+    jobLog(job, `Starting area "${job.startingArea}" already selected.`);
+    return;
+  }
+
+  await filterBtn.click({ timeout: 5000 });
+  await page.waitForTimeout(humanDelay(800, 1500));
+  jobLog(job, `Starting area "${job.startingArea}" filter clicked.`);
+  await saveScreenshot(page, job, "starting-area-selected");
+}
+
 // ---- Group size selection ----
 
 /**
@@ -1403,6 +1563,12 @@ async function attemptBrowserBooking(
       setGroupSize(page, job),
     );
 
+    if (job.startingArea) {
+      await logStepTiming(job, "click starting area filter (booking)", () =>
+        clickStartingAreaFilter(page, job),
+      );
+    }
+
     await page.waitForTimeout(humanDelay(800, 1500));
 
     // Check for "abnormal activity" error before proceeding
@@ -1455,30 +1621,52 @@ async function attemptBrowserBooking(
       }
 
       try {
-        const btn = page.locator(
-          `button.rec-availability-date[aria-label*="${ariaDateStr}"][aria-label*="Available"]:not([disabled])`,
-        );
-        const count = await btn.count();
-        jobLog(job, `  Found ${count} matching button(s)`);
+        let clicked = false;
 
-        if (count > 0) {
-          await btn.first().click({ timeout: 5000 });
-          clickCount++;
-          jobLog(job, `  Clicked! (${clickCount} total)`);
-          await page.waitForTimeout(humanDelay(200, 500));
-        } else {
-          const fallback = page.locator(
-            `button[aria-label*="${ariaDateStr}"]:not([disabled])`,
+        // If a specific trailhead is targeted, try its cells first
+        if (job.trailheadName) {
+          const trailBtn = page.locator(
+            `button.rec-availability-date[aria-label*="${job.trailheadName}"][aria-label*="${ariaDateStr}"][aria-label*="Available"]:not([disabled])`,
           );
-          const fbCount = await fallback.count();
-          jobLog(job, `  Fallback: found ${fbCount} button(s)`);
-          if (fbCount > 0) {
-            await fallback.first().click({ timeout: 5000 });
+          const trailCount = await trailBtn.count();
+          jobLog(job, `  Trailhead "${job.trailheadName}": found ${trailCount} matching button(s)`);
+          if (trailCount > 0) {
+            await trailBtn.first().click({ timeout: 5000 });
             clickCount++;
-            jobLog(job, `  Fallback clicked! (${clickCount} total)`);
+            clicked = true;
+            jobLog(job, `  Trailhead cell clicked! (${clickCount} total)`);
             await page.waitForTimeout(humanDelay(200, 500));
           } else {
-            jobLog(job, `  No available button found for ${nightDate}`);
+            jobLog(job, `  Target trailhead not available for ${nightDate}, falling back to any available...`);
+          }
+        }
+
+        if (!clicked) {
+          const btn = page.locator(
+            `button.rec-availability-date[aria-label*="${ariaDateStr}"][aria-label*="Available"]:not([disabled])`,
+          );
+          const count = await btn.count();
+          jobLog(job, `  Found ${count} matching button(s)`);
+
+          if (count > 0) {
+            await btn.first().click({ timeout: 5000 });
+            clickCount++;
+            jobLog(job, `  Clicked! (${clickCount} total)`);
+            await page.waitForTimeout(humanDelay(200, 500));
+          } else {
+            const fallback = page.locator(
+              `button[aria-label*="${ariaDateStr}"]:not([disabled])`,
+            );
+            const fbCount = await fallback.count();
+            jobLog(job, `  Fallback: found ${fbCount} button(s)`);
+            if (fbCount > 0) {
+              await fallback.first().click({ timeout: 5000 });
+              clickCount++;
+              jobLog(job, `  Fallback clicked! (${clickCount} total)`);
+              await page.waitForTimeout(humanDelay(200, 500));
+            } else {
+              jobLog(job, `  No available button found for ${nightDate}`);
+            }
           }
         }
       } catch (err) {
@@ -1556,6 +1744,9 @@ async function attemptBrowserBooking(
       await page.waitForTimeout(2500);
       await saveScreenshot(page, job, "after-book-click");
     });
+
+    // Check if a login modal appeared after clicking Book Now
+    await handleLoginModal(page, job);
 
     let orderSuccess = false;
     await logStepTiming(job, "fill order details + proceed to cart", async () => {
