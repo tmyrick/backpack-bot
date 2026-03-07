@@ -31,9 +31,9 @@ COPY packages/server/package.json packages/server/
 COPY packages/client/package.json packages/client/
 RUN npm ci --omit=dev
 
-# Install real Google Chrome (not Playwright's Chromium) + Playwright system deps.
-# Real Chrome is harder for bot detection to fingerprint.
-RUN npx -w packages/server playwright install --with-deps chrome
+# Install Firefox via Playwright. Recreation.gov whitelists Firefox,
+# avoiding the "outdated browser" banner that Chromium triggers.
+RUN npx -w packages/server playwright install --with-deps firefox
 
 # Copy built artifacts from build stage
 COPY --from=build /app/packages/server/dist packages/server/dist

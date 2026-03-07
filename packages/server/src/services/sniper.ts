@@ -1,4 +1,4 @@
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import { firefox, type Browser, type BrowserContext, type Page } from "playwright";
 import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
@@ -33,29 +33,21 @@ const POLL_INTERVAL_MS = 1_000; // 1 second — faster detection when window ope
 const MAX_WATCH_DURATION_MS = 60 * 1000; // 60 seconds of polling
 const RECGOV_API = "https://www.recreation.gov/api/permits";
 
-const WINDOWS_CHROME_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const FIREFOX_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0";
 
 /**
- * Launch a browser + context with stealth settings to avoid bot detection.
- * Tries system Chrome first, falls back to bundled Chromium if unavailable.
+ * Launch Firefox with stealth settings to avoid bot detection.
+ * Recreation.gov explicitly whitelists Firefox, eliminating the "outdated browser" banner.
  * Supports optional proxy via PROXY_SERVER env var (e.g. "http://user:pass@host:port").
  */
 async function launchStealthBrowser(): Promise<{ browser: Browser; context: BrowserContext; page: Page }> {
-  const launchArgs = [
-    "--disable-blink-features=AutomationControlled",
-    "--disable-features=IsolateOrigins,site-per-process",
-    "--no-sandbox",
-  ];
-
   const proxyServer = process.env.PROXY_SERVER;
   let proxyConfig: { server: string; username?: string; password?: string } | undefined;
   if (proxyServer) {
     try {
       const url = new URL(proxyServer);
       let username = decodeURIComponent(url.username);
-      // BrightData: append a sticky session ID so the same residential IP
-      // is used for all requests in this browser session.
       if (username && !username.includes("-session-")) {
         username += `-session-${crypto.randomUUID().slice(0, 8)}`;
       }
@@ -70,45 +62,22 @@ async function launchStealthBrowser(): Promise<{ browser: Browser; context: Brow
     }
   }
 
-  const launchOpts: Parameters<typeof chromium.launch>[0] = {
+  const browser = await firefox.launch({
     headless: true,
-    args: launchArgs,
     ...(proxyConfig ? { proxy: proxyConfig } : {}),
-  };
+  });
+  console.log("[sniper] Launched Firefox" + (proxyServer ? " via proxy" : ""));
 
-  let browser: Browser;
-  try {
-    browser = await chromium.launch({ ...launchOpts, channel: "chrome" });
-    console.log("[sniper] Launched system Chrome" + (proxyServer ? ` via proxy` : ""));
-  } catch {
-    browser = await chromium.launch(launchOpts);
-    console.log("[sniper] System Chrome not found, using bundled Chromium" + (proxyServer ? ` via proxy` : ""));
-  }
-
-  const contextOpts: Parameters<typeof browser.newContext>[0] = {
-    userAgent: WINDOWS_CHROME_UA,
+  const context = await browser.newContext({
+    userAgent: FIREFOX_UA,
     viewport: { width: 1920, height: 1080 },
     locale: "en-US",
     timezoneId: "America/Los_Angeles",
-    permissions: ["geolocation"],
     ignoreHTTPSErrors: !!proxyServer,
-  };
+  });
 
-  const context = await browser.newContext(contextOpts);
-
-  // Remove navigator.webdriver flag before any page loads
   await context.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-    // Mimic real Chrome's plugins array (empty in headless, but length > 0 in real)
-    Object.defineProperty(navigator, "plugins", {
-      get: () => [1, 2, 3, 4, 5],
-    });
-    // Mimic real Chrome's languages
-    Object.defineProperty(navigator, "languages", {
-      get: () => ["en-US", "en"],
-    });
-    // Pass Chrome-specific checks
-    (window as any).chrome = { runtime: {}, loadTimes: () => ({}), csi: () => ({}) };
   });
 
   const page = await context.newPage();
@@ -941,7 +910,7 @@ async function checkAvailability(
 
   const res = await fetch(url, {
     headers: {
-      "User-Agent": WINDOWS_CHROME_UA,
+      "User-Agent": FIREFOX_UA,
       Accept: "application/json",
     },
   });
@@ -1003,7 +972,7 @@ async function checkPermitFacilityAvailability(
 
   const res = await fetch(url, {
     headers: {
-      "User-Agent": WINDOWS_CHROME_UA,
+      "User-Agent": FIREFOX_UA,
       Accept: "application/json",
     },
   });
@@ -1085,7 +1054,7 @@ async function checkCampsiteAvailability(
     const url = `${RECGOV_CAMPS_API}/${campgroundId}/month?start_date=${encodeURIComponent(startDate)}`;
     const res = await fetch(url, {
       headers: {
-        "User-Agent": WINDOWS_CHROME_UA,
+        "User-Agent": FIREFOX_UA,
         Accept: "application/json",
       },
     });
@@ -1228,10 +1197,10 @@ async function handleLoginModal(page: Page, job: SniperJob): Promise<boolean> {
 
 async function dismissOutdatedBrowserBanner(page: Page): Promise<void> {
   try {
-    const ignoreBtn = page.locator('button:has-text("Ignore")');
-    if (await ignoreBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
-      await ignoreBtn.click();
-    }
+    await page.evaluate(() => {
+      const buorg = document.getElementById("buorg");
+      if (buorg) buorg.remove();
+    });
   } catch {
     // Banner not present, that's fine
   }
