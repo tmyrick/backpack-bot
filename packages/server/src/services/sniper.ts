@@ -2498,67 +2498,92 @@ async function signInAttempt(
   await page.waitForTimeout(humanDelay(150, 350));
   await dismissOutdatedBrowserBanner(page);
 
-  const emailInput = page.locator('input#email, input[type="email"]').first();
-  try {
-    await emailInput.waitFor({ timeout: 10000 });
-  } catch (err) {
-    console.log("[sniper] Email input not found. Current URL:", page.url());
-    await logLoginPageHtml(page, "Email input timeout — page may have changed or form structure differs.");
-    throw err;
-  }
-  await page.waitForTimeout(humanDelay(150, 350));
-  await humanType(page, emailInput, email, { fast: true });
-
-  await page.waitForTimeout(humanDelay(150, 350));
-
-  const passwordInput = page.locator('input#rec-acct-sign-in-password, input[type="password"]').first();
-  await passwordInput.waitFor({ timeout: 5000 });
-  await humanType(page, passwordInput, password, { fast: true });
-
-  await page.waitForTimeout(humanDelay(800, 1200));
-
-  const submitBtn = page.locator('button.rec-acct-sign-in-btn, button[type="submit"]').first();
-  await submitBtn.waitFor({ timeout: 5000 });
-  await humanClick(page, submitBtn);
-
-  // Wait for navigation away from log-in page
-  try {
-    await page.waitForURL(
-      (url) => !url.pathname.includes("log-in"),
-      { timeout: 20000 },
-    );
-  } catch {
-    if (page.url().includes("log-in")) {
-      await logLoginPageHtml(page, "Login failed. Still on log-in page after submit.");
-      await saveScreenshot(page, job, "login-failed-still-on-page");
-      throw new Error("Login failed. Check your recreation.gov credentials.");
+  // If already logged in (e.g. from previous attempt), skip the form
+  let skipFormFill = await page.locator('[aria-label^="User:"]').first().isVisible().catch(() => false);
+  if (skipFormFill) {
+    console.log("[sniper] Already logged in (detected user in header). Skipping form.");
+  } else {
+    const emailInput = page.locator('input#email, input[type="email"]').first();
+    try {
+      await emailInput.waitFor({ timeout: 10000 });
+    } catch (err) {
+      // On retry we may land on homepage or get redirected (already logged in) — check before failing
+      const userVisible = await page.locator('[aria-label^="User:"]').first().isVisible().catch(() => false);
+      if (userVisible) {
+        console.log("[sniper] Already logged in (redirected from log-in).");
+        skipFormFill = true;
+      } else {
+        console.log("[sniper] Email input not found. Current URL:", page.url());
+        await logLoginPageHtml(page, "Email input timeout — page may have changed or form structure differs.");
+        throw err;
+      }
     }
   }
 
-  // Wait for session to be established — login modal must disappear
-  await page.waitForTimeout(humanDelay(400, 700));
+  if (!skipFormFill) {
+    const emailInput = page.locator('input#email, input[type="email"]').first();
+    await page.waitForTimeout(humanDelay(150, 350));
+    await humanType(page, emailInput, email, { fast: true });
 
-  // Positive check: header shows logged-in user (e.g. "User: Travis M." aria-label)
-  const loggedInUserVisible = await page.locator('[aria-label^="User:"]').first().isVisible().catch(() => false);
-  if (loggedInUserVisible) {
-    console.log("[sniper] Signed in successfully (detected user in header).");
-    // Skip failure checks and go straight to homepage confirmation
-  } else {
-    // Require BOTH email and sign-in password visible — post-login pages may have
-    // a standalone email input (newsletter, signup) which would false-positive
-    const loginFormVisible =
-      (await page.locator('input#email, input[type="email"]').first().isVisible().catch(() => false)) &&
-      (await page.locator('input#rec-acct-sign-in-password, input[type="password"]').first().isVisible().catch(() => false));
-    const hasLoginError = await page.locator('text=/incorrect|error occurred|reset.*password/i').isVisible().catch(() => false);
-    if (loginFormVisible || hasLoginError) {
-      await logLoginPageHtml(
-        page,
-        "Login failed. Wrong credentials or bot detection (reCAPTCHA).",
+    await page.waitForTimeout(humanDelay(150, 350));
+
+    const passwordInput = page.locator('input#rec-acct-sign-in-password, input[type="password"]').first();
+    await passwordInput.waitFor({ timeout: 5000 });
+    await humanType(page, passwordInput, password, { fast: true });
+
+    await page.waitForTimeout(humanDelay(800, 1200));
+
+    const submitBtn = page.locator('button.rec-acct-sign-in-btn, button[type="submit"]').first();
+    await submitBtn.waitFor({ timeout: 5000 });
+    await humanClick(page, submitBtn);
+
+    // Wait for navigation away from log-in page
+    try {
+      await page.waitForURL(
+        (url) => !url.pathname.includes("log-in"),
+        { timeout: 20000 },
       );
-      await saveScreenshot(page, job, "login-failed-wrong-creds-or-bot");
-      throw new Error(
-        "Login failed. Recreation.gov may show 'wrong credentials' when it detects automation (reCAPTCHA/bot detection) even if credentials are correct. Try: HEADLESS=false, no proxy locally, or persistent browser profile.",
-      );
+    } catch {
+      if (page.url().includes("log-in")) {
+        await logLoginPageHtml(page, "Login failed. Still on log-in page after submit.");
+        await saveScreenshot(page, job, "login-failed-still-on-page");
+        throw new Error("Login failed. Check your recreation.gov credentials.");
+      }
+    }
+
+    // Wait for session to be established — login modal must disappear
+    await page.waitForTimeout(humanDelay(400, 700));
+
+    // Wait for React modal overlay to close (form is in modal; underlying page may show user)
+    await page
+      .waitForFunction(
+        () => !document.body.classList.contains("ReactModal__Body--open"),
+        { timeout: 15000 },
+      )
+      .catch(() => {});
+
+    // Positive check: header shows logged-in user (e.g. "User: Travis M." aria-label)
+    const loggedInUserVisible = await page.locator('[aria-label^="User:"]').first().isVisible().catch(() => false);
+    if (loggedInUserVisible) {
+      console.log("[sniper] Signed in successfully (detected user in header).");
+      // Skip failure checks and go straight to homepage confirmation
+    } else {
+      // Require BOTH email and sign-in password visible — post-login pages may have
+      // a standalone email input (newsletter, signup) which would false-positive
+      const loginFormVisible =
+        (await page.locator('input#email, input[type="email"]').first().isVisible().catch(() => false)) &&
+        (await page.locator('input#rec-acct-sign-in-password, input[type="password"]').first().isVisible().catch(() => false));
+      const hasLoginError = await page.locator('text=/incorrect|error occurred|reset.*password/i').isVisible().catch(() => false);
+      if (loginFormVisible || hasLoginError) {
+        await logLoginPageHtml(
+          page,
+          "Login failed. Wrong credentials or bot detection (reCAPTCHA).",
+        );
+        await saveScreenshot(page, job, "login-failed-wrong-creds-or-bot");
+        throw new Error(
+          "Login failed. Recreation.gov may show 'wrong credentials' when it detects automation (reCAPTCHA/bot detection) even if credentials are correct. Try: HEADLESS=false, no proxy locally, or persistent browser profile.",
+        );
+      }
     }
   }
 
