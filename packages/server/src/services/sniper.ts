@@ -2538,21 +2538,28 @@ async function signInAttempt(
   // Wait for session to be established — login modal must disappear
   await page.waitForTimeout(humanDelay(400, 700));
 
-  // Require BOTH email and sign-in password visible — post-login pages may have
-  // a standalone email input (newsletter, signup) which would false-positive
-  const loginFormVisible =
-    (await page.locator('input#email, input[type="email"]').first().isVisible().catch(() => false)) &&
-    (await page.locator('input#rec-acct-sign-in-password, input[type="password"]').first().isVisible().catch(() => false));
-  const hasLoginError = await page.locator('text=/incorrect|error occurred|reset.*password/i').isVisible().catch(() => false);
-  if (loginFormVisible || hasLoginError) {
-    await logLoginPageHtml(
-      page,
-      "Login failed. Wrong credentials or bot detection (reCAPTCHA).",
-    );
-    await saveScreenshot(page, job, "login-failed-wrong-creds-or-bot");
-    throw new Error(
-      "Login failed. Recreation.gov may show 'wrong credentials' when it detects automation (reCAPTCHA/bot detection) even if credentials are correct. Try: HEADLESS=false, no proxy locally, or persistent browser profile.",
-    );
+  // Positive check: header shows logged-in user (e.g. "User: Travis M." aria-label)
+  const loggedInUserVisible = await page.locator('[aria-label^="User:"]').first().isVisible().catch(() => false);
+  if (loggedInUserVisible) {
+    console.log("[sniper] Signed in successfully (detected user in header).");
+    // Skip failure checks and go straight to homepage confirmation
+  } else {
+    // Require BOTH email and sign-in password visible — post-login pages may have
+    // a standalone email input (newsletter, signup) which would false-positive
+    const loginFormVisible =
+      (await page.locator('input#email, input[type="email"]').first().isVisible().catch(() => false)) &&
+      (await page.locator('input#rec-acct-sign-in-password, input[type="password"]').first().isVisible().catch(() => false));
+    const hasLoginError = await page.locator('text=/incorrect|error occurred|reset.*password/i').isVisible().catch(() => false);
+    if (loginFormVisible || hasLoginError) {
+      await logLoginPageHtml(
+        page,
+        "Login failed. Wrong credentials or bot detection (reCAPTCHA).",
+      );
+      await saveScreenshot(page, job, "login-failed-wrong-creds-or-bot");
+      throw new Error(
+        "Login failed. Recreation.gov may show 'wrong credentials' when it detects automation (reCAPTCHA/bot detection) even if credentials are correct. Try: HEADLESS=false, no proxy locally, or persistent browser profile.",
+      );
+    }
   }
 
   // Navigate to homepage to confirm session persists
