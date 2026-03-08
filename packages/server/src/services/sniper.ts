@@ -2538,9 +2538,13 @@ async function signInAttempt(
   // Wait for session to be established — login modal must disappear
   await page.waitForTimeout(humanDelay(400, 700));
 
-  const loginModalVisible = await page.locator('input#email, input[type="email"]').first().isVisible().catch(() => false);
+  // Require BOTH email and sign-in password visible — post-login pages may have
+  // a standalone email input (newsletter, signup) which would false-positive
+  const loginFormVisible =
+    (await page.locator('input#email, input[type="email"]').first().isVisible().catch(() => false)) &&
+    (await page.locator('input#rec-acct-sign-in-password, input[type="password"]').first().isVisible().catch(() => false));
   const hasLoginError = await page.locator('text=/incorrect|error occurred|reset.*password/i').isVisible().catch(() => false);
-  if (loginModalVisible || hasLoginError) {
+  if (loginFormVisible || hasLoginError) {
     await logLoginPageHtml(
       page,
       "Login failed. Wrong credentials or bot detection (reCAPTCHA).",
