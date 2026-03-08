@@ -1283,26 +1283,34 @@ async function humanClick(page: Page, locator: ReturnType<Page["locator"]>, opts
 
 /**
  * Type text character-by-character with variable delay to mimic human typing.
+ * @param opts.fast - Use shorter delays (18-45ms/char) for login etc.; default is 30-80ms
+ * @param opts.clearFirst - Select-all and clear before typing
  */
 async function humanType(
   page: Page,
   locator: ReturnType<Page["locator"]>,
   text: string,
-  opts?: { clearFirst?: boolean },
+  opts?: { clearFirst?: boolean; fast?: boolean },
 ): Promise<void> {
   await locator.first().click();
-  await page.waitForTimeout(humanDelay(50, 120));
+  await page.waitForTimeout(opts?.fast ? humanDelay(30, 70) : humanDelay(50, 120));
   if (opts?.clearFirst) {
     const mod = process.platform === "darwin" ? "Meta" : "Control";
     await page.keyboard.press(`${mod}+a`);
-    await page.waitForTimeout(humanDelay(50, 120));
+    await page.waitForTimeout(opts?.fast ? humanDelay(30, 60) : humanDelay(50, 120));
   }
-  const delayPerChar = 30 + Math.floor(Math.random() * 50);
   const chars = text.split("");
+  const delayMin = opts?.fast ? 18 : 30;
+  const delayRange = opts?.fast ? 27 : 50;
+  const pauseEvery = opts?.fast ? 12 + Math.floor(Math.random() * 6) : 4 + Math.floor(Math.random() * 4);
   for (let i = 0; i < chars.length; i++) {
-    await page.keyboard.type(chars[i], { delay: delayPerChar });
-    if (i > 0 && i % (4 + Math.floor(Math.random() * 4)) === 0) {
-      await page.waitForTimeout(humanDelay(50, 150));
+    await page.keyboard.type(chars[i]);
+    if (i < chars.length - 1) {
+      const delayMs = delayMin + Math.floor(Math.random() * delayRange);
+      await page.waitForTimeout(delayMs);
+      if (i > 0 && i % pauseEvery === 0) {
+        await page.waitForTimeout(opts?.fast ? humanDelay(20, 50) : humanDelay(50, 150));
+      }
     }
   }
 }
@@ -1705,78 +1713,65 @@ async function checkGridAvailabilityForRange(
   nightDates: string[],
   trailheadName: string | null,
 ): Promise<{ allAvailable: boolean; unavailableDates: string[] }> {
-  const result = await page.evaluate(
-    (args: { nightDates: string[]; trailheadName: string | null }) => {
-      const { nightDates, trailheadName } = args;
-
-      const parseHeaderDate = (text: string): string | null => {
-        // "Thursday, June 18, 2026" or "June 18, 2026"
-        const m = text.match(/(\w+)\s+(\d{1,2}),\s*(\d{4})/);
-        if (!m) return null;
-        const d = new Date(`${m[1]} ${m[2]}, ${m[3]}`);
-        if (isNaN(d.getTime())) return null;
-        return d.toISOString().slice(0, 10);
-      };
-
-      const normalize = (s: string) => s.toLowerCase().trim().replace(/\s+/g, " ");
-      const fuzzyMatch = (rowText: string, target: string): boolean => {
-        const a = normalize(rowText);
-        const b = normalize(target);
-        return a.includes(b) || b.includes(a);
-      };
-
-      const grid = document.querySelector(
-        '.detailed-availability-grid-new, [aria-label="Availability by Trailhead and Dates"]',
-      );
-      if (!grid) return { allAvailable: true, unavailableDates: [] };
-
-      const rows = grid.querySelectorAll('[data-testid="Row"]');
-      if (rows.length < 2) return { allAvailable: true, unavailableDates: [] };
-
-      // Header row: first row with grid-header-cell
-      const headerRow = rows[0];
-      const headerCells = headerRow.querySelectorAll('[data-testid="grid-header-cell"]');
-      const dateToColIndex = new Map<string, number>();
-      for (let i = 2; i < headerCells.length; i++) {
-        const cell = headerCells[i];
-        const sr = cell.querySelector(".rec-sr-only");
-        const text = sr?.textContent?.trim() || "";
-        const dateStr = parseHeaderDate(text);
-        if (dateStr) dateToColIndex.set(dateStr, i);
+  // Use new Function to avoid bundler-injected __name breaking browser eval (tsx/esbuild)
+  const evalBody = `
+    const { nightDates: nd, trailheadName: tn } = args;
+    const parseHeaderDate = (text) => {
+      const m = text.match(/(\\w+)\\s+(\\d{1,2}),\\s*(\\d{4})/);
+      if (!m) return null;
+      const d = new Date(m[1] + " " + m[2] + ", " + m[3]);
+      if (isNaN(d.getTime())) return null;
+      return d.toISOString().slice(0, 10);
+    };
+    const normalize = (s) => s.toLowerCase().trim().replace(/\\s+/g, " ");
+    const fuzzyMatch = (rowText, target) =>
+      normalize(rowText).includes(normalize(target)) || normalize(target).includes(normalize(rowText));
+    const grid = document.querySelector('.detailed-availability-grid-new, [aria-label="Availability by Trailhead and Dates"]');
+    if (!grid) return { allAvailable: true, unavailableDates: [] };
+    const rows = grid.querySelectorAll('[data-testid="Row"]');
+    if (rows.length < 2) return { allAvailable: true, unavailableDates: [] };
+    const headerRow = rows[0];
+    const headerCells = headerRow.querySelectorAll('[data-testid="grid-header-cell"]');
+    const dateToColIndex = new Map();
+    for (let i = 2; i < headerCells.length; i++) {
+      const cell = headerCells[i];
+      const sr = cell.querySelector(".rec-sr-only");
+      const text = (sr && sr.textContent ? sr.textContent : "").trim();
+      const dateStr = parseHeaderDate(text);
+      if (dateStr) dateToColIndex.set(dateStr, i);
+    }
+    let targetRow = null;
+    for (let r = 1; r < rows.length; r++) {
+      const row = rows[r];
+      const trailheadCell = row.querySelector('[data-testid="grid-cell"]');
+      const trailheadText = (trailheadCell && trailheadCell.textContent ? trailheadCell.textContent : "").trim();
+      if (!tn || fuzzyMatch(trailheadText, tn)) {
+        targetRow = row;
+        break;
       }
-
-      // Find target row: match trailhead by fuzzy name, or use first data row
-      let targetRow: Element | null = null;
-      for (let r = 1; r < rows.length; r++) {
-        const row = rows[r];
-        const trailheadCell = row.querySelector('[data-testid="grid-cell"]');
-        const trailheadText = trailheadCell?.textContent?.trim() || "";
-        if (!trailheadName || fuzzyMatch(trailheadText, trailheadName)) {
-          targetRow = row;
-          break;
-        }
-      }
-      if (!targetRow) return { allAvailable: true, unavailableDates: [] };
-
-      const cells = targetRow.querySelectorAll('[data-testid="grid-cell"], [data-testid="availability-cell"]');
-      const unavailableDates: string[] = [];
-      for (const nightDate of nightDates) {
-        const colIndex = dateToColIndex.get(nightDate);
-        if (colIndex === undefined) continue; // date not in visible grid, assume available
-        const dateCell = cells[colIndex];
-        if (!dateCell) continue;
-        const isUnavailable =
-          dateCell.classList.contains("unavailable") ||
-          (dateCell.querySelector("button") as HTMLButtonElement | null)?.disabled === true;
-        if (isUnavailable) unavailableDates.push(nightDate);
-      }
-
-      const allAvailable = unavailableDates.length === 0;
-      return { allAvailable, unavailableDates };
-    },
-    { nightDates, trailheadName },
-  );
-  return result;
+    }
+    if (!targetRow) return { allAvailable: true, unavailableDates: [] };
+    const cells = targetRow.querySelectorAll('[data-testid="grid-cell"], [data-testid="availability-cell"]');
+    const unavailableDates = [];
+    for (const nightDate of nd) {
+      const colIndex = dateToColIndex.get(nightDate);
+      if (colIndex === undefined) continue;
+      const dateCell = cells[colIndex];
+      if (!dateCell) continue;
+      const btn = dateCell.querySelector("button");
+      const isUnavailable = dateCell.classList.contains("unavailable") || (btn && btn.disabled === true);
+      if (isUnavailable) unavailableDates.push(nightDate);
+    }
+    return { allAvailable: unavailableDates.length === 0, unavailableDates };
+  `;
+  const fn = new Function("args", evalBody) as (args: { nightDates: string[]; trailheadName: string | null }) => {
+    allAvailable: boolean;
+    unavailableDates: string[];
+  };
+  return page.evaluate(fn, { nightDates, trailheadName }) as Promise<{
+    allAvailable: boolean;
+    unavailableDates: string[];
+  }>;
 }
 
 // ---- Browser booking ----
@@ -2389,6 +2384,25 @@ async function attemptCampsiteBooking(
 const SIGN_IN_MAX_RETRIES = 3;
 const SIGN_IN_RETRY_DELAY_MS = 5000;
 
+const LOGIN_PAGE_HTML_TRUNCATE = 12000;
+
+async function logLoginPageHtml(page: Page, context: string): Promise<void> {
+  try {
+    const html = await page.content();
+    const truncated = html.length > LOGIN_PAGE_HTML_TRUNCATE;
+    const snippet = truncated ? html.slice(0, LOGIN_PAGE_HTML_TRUNCATE) : html;
+    console.log(`[sniper] ${context}`);
+    console.log(`[sniper] Login page HTML (${truncated ? `first ${LOGIN_PAGE_HTML_TRUNCATE} chars of ${html.length}` : html.length} chars):`);
+    console.log(snippet);
+    if (truncated) {
+      console.log(`[sniper] ... (truncated, ${html.length - LOGIN_PAGE_HTML_TRUNCATE} more chars)`);
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.log(`[sniper] Failed to capture login page HTML: ${msg}`);
+  }
+}
+
 async function signIn(
   page: Page,
   email: string,
@@ -2467,15 +2481,13 @@ async function signInAttempt(
   const emailInput = page.locator("input#email");
   await emailInput.waitFor({ timeout: 10000 });
   await page.waitForTimeout(humanDelay(150, 350));
-  await humanClick(page, emailInput);
-  await emailInput.fill(email);
+  await humanType(page, emailInput, email, { fast: true });
 
-  await page.waitForTimeout(humanDelay(200, 400));
+  await page.waitForTimeout(humanDelay(150, 350));
 
   const passwordInput = page.locator("input#rec-acct-sign-in-password");
   await passwordInput.waitFor({ timeout: 5000 });
-  await humanClick(page, passwordInput);
-  await passwordInput.fill(password);
+  await humanType(page, passwordInput, password, { fast: true });
 
   await page.waitForTimeout(humanDelay(800, 1200));
 
@@ -2491,6 +2503,7 @@ async function signInAttempt(
     );
   } catch {
     if (page.url().includes("log-in")) {
+      await logLoginPageHtml(page, "Login failed. Still on log-in page after submit.");
       throw new Error("Login failed. Check your recreation.gov credentials.");
     }
   }
@@ -2501,6 +2514,10 @@ async function signInAttempt(
   const loginModalVisible = await page.locator("input#email").isVisible().catch(() => false);
   const hasLoginError = await page.locator('text=/incorrect|error occurred|reset.*password/i').isVisible().catch(() => false);
   if (loginModalVisible || hasLoginError) {
+    await logLoginPageHtml(
+      page,
+      "Login failed. Wrong credentials or bot detection (reCAPTCHA).",
+    );
     throw new Error(
       "Login failed. Recreation.gov may show 'wrong credentials' when it detects automation (reCAPTCHA/bot detection) even if credentials are correct. Try: HEADLESS=false, no proxy locally, or persistent browser profile.",
     );
@@ -2512,6 +2529,7 @@ async function signInAttempt(
 
   const stillLoggedOut = await page.locator('#ga-global-nav-log-in-link, [aria-label*="Sign Up"][aria-label*="Log In"]').first().isVisible().catch(() => false);
   if (stillLoggedOut) {
+    await logLoginPageHtml(page, "Login failed. Session did not persist.");
     throw new Error(
       "Login failed. Session did not persist. Recreation.gov often blocks automated logins (reCAPTCHA). Try HEADLESS=false and/or disable PROXY_SERVER locally.",
     );
