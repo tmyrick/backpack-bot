@@ -381,7 +381,18 @@ function SniperForm({
     value: string,
   ) =>
     setDesiredRanges((r) =>
-      r.map((v, i) => (i === index ? { ...v, [field]: value } : v)),
+      r.map((v, i) => {
+        if (i !== index) return v;
+        const next = { ...v, [field]: value };
+        if (field === "startDate" && value) {
+          const d = new Date(value + "T00:00:00");
+          if (!isNaN(d.getTime())) {
+            d.setDate(d.getDate() + 2);
+            next.endDate = d.toISOString().slice(0, 10);
+          }
+        }
+        return next;
+      }),
     );
   const moveRange = (index: number, direction: -1 | 1) => {
     const newIndex = index + direction;
