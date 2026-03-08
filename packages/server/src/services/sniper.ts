@@ -372,7 +372,7 @@ async function runPermitSniperJob(job: SniperJob): Promise<void> {
 
     jobLog(job, "Starting sign-in...");
     await logStepTiming(job, "sign-in", () =>
-      signIn(page, creds.email, creds.password),
+      signIn(page, creds.email, creds.password, job),
     );
     jobLog(job, "Sign-in complete. Current URL:", page.url());
     if (signal.aborted) return;
@@ -625,7 +625,7 @@ async function runCampsiteSniperJob(job: SniperJob): Promise<void> {
 
     jobLog(job, "Starting sign-in...");
     await logStepTiming(job, "sign-in", () =>
-      signIn(page, creds.email, creds.password),
+      signIn(page, creds.email, creds.password, job),
     );
     jobLog(job, "Sign-in complete. Current URL:", page.url());
     if (signal.aborted) return;
@@ -1181,19 +1181,22 @@ async function logStepTiming<T>(
 
 async function saveScreenshot(
   page: Page,
-  job: SniperJob,
+  job: SniperJob | null,
   label: string,
 ): Promise<string | null> {
   try {
     await fs.mkdir(SCREENSHOTS_DIR, { recursive: true });
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const filename = `${timestamp}_${job.id.slice(0, 8)}-${label}.png`;
+    const idPart = job ? job.id.slice(0, 8) : "login";
+    const filename = `${timestamp}_${idPart}-${label}.png`;
     const filepath = path.join(SCREENSHOTS_DIR, filename);
     await page.screenshot({ path: filepath, fullPage: true });
-    jobLog(job, `Screenshot saved: data/screenshots/${filename}`);
+    if (job) jobLog(job, `Screenshot saved: data/screenshots/${filename}`);
+    else console.log(`[sniper] Screenshot saved: data/screenshots/${filename}`);
     return filepath;
   } catch (err) {
-    jobLog(job, "Failed to save screenshot:", err);
+    if (job) jobLog(job, "Failed to save screenshot:", err);
+    else console.log("[sniper] Failed to save screenshot:", err);
     return null;
   }
 }
@@ -1220,7 +1223,7 @@ async function handleLoginModal(page: Page, job: SniperJob): Promise<boolean> {
   const creds = getRecgovCredentials();
 
   try {
-    await signIn(page, creds.email, creds.password);
+    await signIn(page, creds.email, creds.password, job);
     jobLog(job, "Re-authentication via full login page succeeded.");
     await saveScreenshot(page, job, "reauth-success");
   } catch (err) {
@@ -2388,11 +2391,26 @@ const LOGIN_PAGE_HTML_TRUNCATE = 12000;
 
 async function logLoginPageHtml(page: Page, context: string): Promise<void> {
   try {
+    // Extract form HTML to see actual input IDs/names (helps debug selector changes)
+    const formHtml = await page
+      .evaluate(() => {
+        const form = document.querySelector("form");
+        if (!form) return null;
+        return form.outerHTML.slice(0, 6000);
+      })
+      .catch(() => null);
+    if (formHtml) {
+      console.log(`[sniper] Form HTML (first 6k chars):`);
+      console.log(formHtml);
+    } else {
+      console.log(`[sniper] No form element found in DOM`);
+    }
+
     const html = await page.content();
     const truncated = html.length > LOGIN_PAGE_HTML_TRUNCATE;
     const snippet = truncated ? html.slice(0, LOGIN_PAGE_HTML_TRUNCATE) : html;
     console.log(`[sniper] ${context}`);
-    console.log(`[sniper] Login page HTML (${truncated ? `first ${LOGIN_PAGE_HTML_TRUNCATE} chars of ${html.length}` : html.length} chars):`);
+    console.log(`[sniper] Full page HTML (${truncated ? `first ${LOGIN_PAGE_HTML_TRUNCATE} chars of ${html.length}` : html.length} chars):`);
     console.log(snippet);
     if (truncated) {
       console.log(`[sniper] ... (truncated, ${html.length - LOGIN_PAGE_HTML_TRUNCATE} more chars)`);
@@ -2407,13 +2425,14 @@ async function signIn(
   page: Page,
   email: string,
   password: string,
+  job?: SniperJob | null,
 ): Promise<void> {
   console.log("[sniper] Signing in...");
 
   let lastErr: Error | null = null;
   for (let attempt = 1; attempt <= SIGN_IN_MAX_RETRIES; attempt++) {
     try {
-      await signInAttempt(page, email, password);
+      await signInAttempt(page, email, password, job ?? null);
       return;
     } catch (err) {
       lastErr = err instanceof Error ? err : new Error(String(err));
@@ -2431,6 +2450,7 @@ async function signInAttempt(
   page: Page,
   email: string,
   password: string,
+  job: SniperJob | null,
 ): Promise<void> {
   // Visit homepage first to warm cookies/session like a real user
   const maxNavRetries = 3;
@@ -2478,20 +2498,26 @@ async function signInAttempt(
   await page.waitForTimeout(humanDelay(150, 350));
   await dismissOutdatedBrowserBanner(page);
 
-  const emailInput = page.locator("input#email");
-  await emailInput.waitFor({ timeout: 10000 });
+  const emailInput = page.locator('input#email, input[type="email"]').first();
+  try {
+    await emailInput.waitFor({ timeout: 10000 });
+  } catch (err) {
+    console.log("[sniper] Email input not found. Current URL:", page.url());
+    await logLoginPageHtml(page, "Email input timeout — page may have changed or form structure differs.");
+    throw err;
+  }
   await page.waitForTimeout(humanDelay(150, 350));
   await humanType(page, emailInput, email, { fast: true });
 
   await page.waitForTimeout(humanDelay(150, 350));
 
-  const passwordInput = page.locator("input#rec-acct-sign-in-password");
+  const passwordInput = page.locator('input#rec-acct-sign-in-password, input[type="password"]').first();
   await passwordInput.waitFor({ timeout: 5000 });
   await humanType(page, passwordInput, password, { fast: true });
 
   await page.waitForTimeout(humanDelay(800, 1200));
 
-  const submitBtn = page.locator("button.rec-acct-sign-in-btn");
+  const submitBtn = page.locator('button.rec-acct-sign-in-btn, button[type="submit"]').first();
   await submitBtn.waitFor({ timeout: 5000 });
   await humanClick(page, submitBtn);
 
@@ -2504,6 +2530,7 @@ async function signInAttempt(
   } catch {
     if (page.url().includes("log-in")) {
       await logLoginPageHtml(page, "Login failed. Still on log-in page after submit.");
+      await saveScreenshot(page, job, "login-failed-still-on-page");
       throw new Error("Login failed. Check your recreation.gov credentials.");
     }
   }
@@ -2511,13 +2538,14 @@ async function signInAttempt(
   // Wait for session to be established — login modal must disappear
   await page.waitForTimeout(humanDelay(400, 700));
 
-  const loginModalVisible = await page.locator("input#email").isVisible().catch(() => false);
+  const loginModalVisible = await page.locator('input#email, input[type="email"]').first().isVisible().catch(() => false);
   const hasLoginError = await page.locator('text=/incorrect|error occurred|reset.*password/i').isVisible().catch(() => false);
   if (loginModalVisible || hasLoginError) {
     await logLoginPageHtml(
       page,
       "Login failed. Wrong credentials or bot detection (reCAPTCHA).",
     );
+    await saveScreenshot(page, job, "login-failed-wrong-creds-or-bot");
     throw new Error(
       "Login failed. Recreation.gov may show 'wrong credentials' when it detects automation (reCAPTCHA/bot detection) even if credentials are correct. Try: HEADLESS=false, no proxy locally, or persistent browser profile.",
     );
@@ -2530,6 +2558,7 @@ async function signInAttempt(
   const stillLoggedOut = await page.locator('#ga-global-nav-log-in-link, [aria-label*="Sign Up"][aria-label*="Log In"]').first().isVisible().catch(() => false);
   if (stillLoggedOut) {
     await logLoginPageHtml(page, "Login failed. Session did not persist.");
+    await saveScreenshot(page, job, "login-failed-session-not-persisted");
     throw new Error(
       "Login failed. Session did not persist. Recreation.gov often blocks automated logins (reCAPTCHA). Try HEADLESS=false and/or disable PROXY_SERVER locally.",
     );
