@@ -475,9 +475,33 @@ async function runPermitSniperJob(job: SniperJob): Promise<void> {
     if (signal.aborted) return;
 
     if (!foundRange) {
+      // No availability detected for any range. Try fallback: attempt browser booking
+      // for each range anyway (API may be stale, or UI may show different availability).
+      jobLog(job, `No availability in API after ${job.attempts} polls. Trying fallback: attempt browser booking for each date range...`);
+      for (const fallbackRange of job.desiredDateRanges) {
+        if (signal.aborted) return;
+
+        updateJob(job, {
+          status: "booking",
+          message: `No API availability. Trying ${fallbackRange.startDate} - ${fallbackRange.endDate} via browser...`,
+        });
+        await saveJobs();
+
+        const result = await attemptBrowserBooking(page, job, fallbackRange);
+        if (result === "booked") {
+          updateJob(job, {
+            status: "in-cart",
+            bookedRange: fallbackRange,
+            message: `Permit for ${fallbackRange.startDate} - ${fallbackRange.endDate} (fallback) added to cart! Complete purchase on recreation.gov.`,
+          });
+          await saveJobs();
+          return;
+        }
+      }
+
       updateJob(job, {
         status: "failed",
-        message: `No availability detected after ${job.attempts} polls (${MAX_WATCH_DURATION_MS / 1000}s). Window may have passed.`,
+        message: `No availability detected after ${job.attempts} polls (${MAX_WATCH_DURATION_MS / 1000}s). Tried all ${job.desiredDateRanges.length} date range(s) via browser. Window may have passed.`,
       });
       await saveJobs();
       return;
@@ -1399,57 +1423,108 @@ async function dismissTrafficModal(
   return true;
 }
 
-// ---- Cart expiry modal handler ----
+// ---- Cart keep-alive (Modify -> Order Details -> Proceed to Cart resets timer) ----
 
-const CART_EXPIRY_CHECK_INTERVAL_MS = 60_000; // Check every 60 seconds
+const CART_KEEPALIVE_INTERVAL_MIN_MS = 5 * 60 * 1000; // 5 minutes
+const CART_KEEPALIVE_INTERVAL_MAX_MS = 9 * 60 * 1000; // 9 minutes
+const CART_KEEPALIVE_WAIT_ON_ORDER_DETAILS_MIN_MS = 10 * 1000; // 10 seconds
+const CART_KEEPALIVE_WAIT_ON_ORDER_DETAILS_MAX_MS = 30 * 1000; // 30 seconds
 
 /**
- * Recreation.gov shows "Your cart is about to expire" modal with "Add Five Minutes" button.
- * Detects it and clicks to extend cart time. Returns true if modal was found and dismissed.
+ * Perform one keep-alive cycle: click Modify on cart -> Order Details -> wait -> Proceed to Cart.
+ * Resets the cart timer. Returns true if successful.
  */
-async function dismissCartExpiryModalIfPresent(
+async function runCartKeepAliveCycle(
   page: Page,
   job: SniperJob,
 ): Promise<boolean> {
   try {
-    const modal = page.locator(
-      '.sarsa-modal-content-body:has-text("Your cart is about to expire")',
+    const url = page.url();
+    if (!url.includes("/cart")) {
+      jobLog(job, "Cart keep-alive: not on cart page, skipping.");
+      return false;
+    }
+
+    const modifyBtn = page.locator(
+      'button[aria-label="Edit Reservation"], button.rec-button-link[title="Edit Reservation"]',
     );
-    const isVisible = await modal.isVisible({ timeout: 500 }).catch(() => false);
-    if (!isVisible) return false;
+    const isVisible = await modifyBtn.first().isVisible({ timeout: 3000 }).catch(() => false);
+    if (!isVisible) {
+      jobLog(job, "Cart keep-alive: Modify button not found, skipping.");
+      return false;
+    }
 
-    jobLog(job, "Cart expiry modal detected. Clicking Add Five Minutes...");
-    await saveScreenshot(page, job, "cart-expiry-modal-before");
+    jobLog(job, "Cart keep-alive: clicking Modify to reset timer...");
+    await humanClick(page, modifyBtn.first());
+    await page.waitForTimeout(1000);
 
-    const addMinutesBtn = modal.locator('button:has-text("Add Five Minutes")');
-    await addMinutesBtn.click({ timeout: 5000 });
-    await page.waitForTimeout(500);
+    const orderDetailsBtn = page.locator('button[data-testid="OrderDetailsSummary-cart-btn"]');
+    await orderDetailsBtn.waitFor({ state: "visible", timeout: 15000 });
+    jobLog(job, "Cart keep-alive: on Order Details page.");
 
-    jobLog(job, "Cart extended by 5 minutes.");
-    await saveScreenshot(page, job, "cart-expiry-modal-dismissed");
-    return true;
-  } catch {
+    const waitMs = humanDelay(
+      CART_KEEPALIVE_WAIT_ON_ORDER_DETAILS_MIN_MS,
+      CART_KEEPALIVE_WAIT_ON_ORDER_DETAILS_MAX_MS,
+    );
+    jobLog(job, `Cart keep-alive: waiting ${Math.round(waitMs / 1000)}s (with mouse/scroll) before Proceed to Cart...`);
+    const waitStart = Date.now();
+    await simulateBrowsing(page);
+    await page.waitForTimeout(humanDelay(2000, 5000));
+    await simulateBrowsing(page);
+    const elapsed = Date.now() - waitStart;
+    await page.waitForTimeout(Math.max(0, waitMs - elapsed));
+
+    await humanClick(page, orderDetailsBtn);
+    await page.waitForTimeout(1500);
+
+    const backOnCart = page.url().includes("/cart");
+    if (backOnCart) {
+      jobLog(job, "Cart keep-alive: back on cart. Timer reset.");
+      await saveScreenshot(page, job, "cart-keepalive-done");
+    } else {
+      jobLog(job, "Cart keep-alive: may not have returned to cart. URL:", page.url());
+    }
+    return backOnCart;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    jobLog(job, "Cart keep-alive error:", msg);
+    await saveScreenshot(page, job, "cart-keepalive-error");
     return false;
   }
 }
 
 /**
- * Start a periodic check for the cart expiry modal and dismiss it when present.
- * Call the returned function to stop the interval.
+ * Start a periodic cart keep-alive: every 5-9 min (randomized), click Modify -> Order Details ->
+ * wait 10-30s -> Proceed to Cart. This resets the cart timer. Call the returned function to stop.
  */
-function startCartExpiryWatcher(
+function startCartKeepAliveWatcher(
   page: Page,
   job: SniperJob,
 ): () => void {
-  const interval = setInterval(async () => {
-    try {
-      await dismissCartExpiryModalIfPresent(page, job);
-    } catch {
-      // Ignore errors in background check
-    }
-  }, CART_EXPIRY_CHECK_INTERVAL_MS);
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  let stopped = false;
 
-  return () => clearInterval(interval);
+  const scheduleNext = () => {
+    if (stopped) return;
+    const delayMs = humanDelay(CART_KEEPALIVE_INTERVAL_MIN_MS, CART_KEEPALIVE_INTERVAL_MAX_MS);
+    jobLog(job, `Cart keep-alive: next run in ${Math.round(delayMs / 60000)} min.`);
+    timeoutId = setTimeout(async () => {
+      if (stopped) return;
+      try {
+        await runCartKeepAliveCycle(page, job);
+      } catch {
+        // Logged in runCartKeepAliveCycle
+      }
+      scheduleNext();
+    }, delayMs);
+  };
+
+  scheduleNext();
+
+  return () => {
+    stopped = true;
+    if (timeoutId) clearTimeout(timeoutId);
+  };
 }
 
 /**
@@ -1620,6 +1695,90 @@ async function setGroupSize(page: Page, job: SniperJob): Promise<void> {
   }
 }
 
+/**
+ * Quickly check if desired dates are available in the permit grid by parsing the DOM.
+ * Uses header row for date columns, fuzzy-matches trailhead row, and checks for
+ * "unavailable" class or disabled buttons. Enables early bail when dates are gone.
+ */
+async function checkGridAvailabilityForRange(
+  page: Page,
+  nightDates: string[],
+  trailheadName: string | null,
+): Promise<{ allAvailable: boolean; unavailableDates: string[] }> {
+  const result = await page.evaluate(
+    (args: { nightDates: string[]; trailheadName: string | null }) => {
+      const { nightDates, trailheadName } = args;
+
+      const parseHeaderDate = (text: string): string | null => {
+        // "Thursday, June 18, 2026" or "June 18, 2026"
+        const m = text.match(/(\w+)\s+(\d{1,2}),\s*(\d{4})/);
+        if (!m) return null;
+        const d = new Date(`${m[1]} ${m[2]}, ${m[3]}`);
+        if (isNaN(d.getTime())) return null;
+        return d.toISOString().slice(0, 10);
+      };
+
+      const normalize = (s: string) => s.toLowerCase().trim().replace(/\s+/g, " ");
+      const fuzzyMatch = (rowText: string, target: string): boolean => {
+        const a = normalize(rowText);
+        const b = normalize(target);
+        return a.includes(b) || b.includes(a);
+      };
+
+      const grid = document.querySelector(
+        '.detailed-availability-grid-new, [aria-label="Availability by Trailhead and Dates"]',
+      );
+      if (!grid) return { allAvailable: true, unavailableDates: [] };
+
+      const rows = grid.querySelectorAll('[data-testid="Row"]');
+      if (rows.length < 2) return { allAvailable: true, unavailableDates: [] };
+
+      // Header row: first row with grid-header-cell
+      const headerRow = rows[0];
+      const headerCells = headerRow.querySelectorAll('[data-testid="grid-header-cell"]');
+      const dateToColIndex = new Map<string, number>();
+      for (let i = 2; i < headerCells.length; i++) {
+        const cell = headerCells[i];
+        const sr = cell.querySelector(".rec-sr-only");
+        const text = sr?.textContent?.trim() || "";
+        const dateStr = parseHeaderDate(text);
+        if (dateStr) dateToColIndex.set(dateStr, i);
+      }
+
+      // Find target row: match trailhead by fuzzy name, or use first data row
+      let targetRow: Element | null = null;
+      for (let r = 1; r < rows.length; r++) {
+        const row = rows[r];
+        const trailheadCell = row.querySelector('[data-testid="grid-cell"]');
+        const trailheadText = trailheadCell?.textContent?.trim() || "";
+        if (!trailheadName || fuzzyMatch(trailheadText, trailheadName)) {
+          targetRow = row;
+          break;
+        }
+      }
+      if (!targetRow) return { allAvailable: true, unavailableDates: [] };
+
+      const cells = targetRow.querySelectorAll('[data-testid="grid-cell"], [data-testid="availability-cell"]');
+      const unavailableDates: string[] = [];
+      for (const nightDate of nightDates) {
+        const colIndex = dateToColIndex.get(nightDate);
+        if (colIndex === undefined) continue; // date not in visible grid, assume available
+        const dateCell = cells[colIndex];
+        if (!dateCell) continue;
+        const isUnavailable =
+          dateCell.classList.contains("unavailable") ||
+          (dateCell.querySelector("button") as HTMLButtonElement | null)?.disabled === true;
+        if (isUnavailable) unavailableDates.push(nightDate);
+      }
+
+      const allAvailable = unavailableDates.length === 0;
+      return { allAvailable, unavailableDates };
+    },
+    { nightDates, trailheadName },
+  );
+  return result;
+}
+
 // ---- Browser booking ----
 
 async function attemptBrowserBooking(
@@ -1683,6 +1842,21 @@ async function attemptBrowserBooking(
 
     const nightDates = expandRange(targetRange);
     jobLog(job, "Night dates to book:", nightDates);
+
+    // Quick grid check: parse DOM to detect unavailable dates before clicking
+    const gridCheck = await checkGridAvailabilityForRange(
+      page,
+      nightDates,
+      job.trailheadName || null,
+    );
+    if (!gridCheck.allAvailable) {
+      jobLog(
+        job,
+        `Grid check: ${gridCheck.unavailableDates.length} date(s) unavailable for ${job.trailheadName || "selected row"}: ${gridCheck.unavailableDates.join(", ")}. Skipping.`,
+      );
+      await saveScreenshot(page, job, "grid-dates-unavailable");
+      return "failed";
+    }
 
     let clickCount = 0;
 
@@ -1949,11 +2123,7 @@ async function fillOrderDetails(page: Page, job: SniperJob): Promise<boolean> {
     return false;
   }
 
-  const stopCartExpiryWatcher = startCartExpiryWatcher(page, job);
-
   try {
-    await dismissCartExpiryModalIfPresent(page, job);
-
     // Check for abnormal activity error before waiting for form
     if (await hasAbnormalActivityError(page)) {
       jobLog(job, "Abnormal activity error detected on order details page.");
@@ -2008,8 +2178,14 @@ async function fillOrderDetails(page: Page, job: SniperJob): Promise<boolean> {
     await humanClick(page, cartBtn);
     jobLog(job, "Clicked Proceed to Cart!");
 
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(1500);
+    await page.waitForURL(/\/cart/, { timeout: 10000 }).catch(() => {});
     await saveScreenshot(page, job, "after-proceed-to-cart");
+
+    if (page.url().includes("/cart")) {
+      jobLog(job, "On cart page. Starting cart keep-alive watcher (Modify -> Order Details -> Proceed to Cart every 5-9 min).");
+      startCartKeepAliveWatcher(page, job);
+    }
 
     return true;
   } catch (err) {
@@ -2017,8 +2193,6 @@ async function fillOrderDetails(page: Page, job: SniperJob): Promise<boolean> {
     jobLog(job, "Error filling order details:", msg);
     await saveScreenshot(page, job, "order-details-error");
     return false;
-  } finally {
-    stopCartExpiryWatcher();
   }
 }
 
