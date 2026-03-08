@@ -1548,6 +1548,13 @@ async function setGroupSize(page: Page, job: SniperJob): Promise<void> {
   //       Plus:   button[aria-label="Add Peoples"]
   //       Close:  .sarsa-dropdown-base-popup-actions button (text "Close")
 
+  const trigger = page.locator("button#guest-counter-QuotaUsageByMemberDaily");
+  const isPresent = await trigger.isVisible({ timeout: 3000 }).catch(() => false);
+  if (!isPresent) {
+    jobLog(job, "Group members selector not present — skipping (permit may have fixed group size).");
+    return;
+  }
+
   const peopleInput = page.locator(
     "input#guest-counter-QuotaUsageByMemberDaily-number-field-People",
   );
@@ -1555,8 +1562,6 @@ async function setGroupSize(page: Page, job: SniperJob): Promise<void> {
 
   try {
     jobLog(job, "Step 1: Opening group members dropdown...");
-    const trigger = page.locator("button#guest-counter-QuotaUsageByMemberDaily");
-    await trigger.waitFor({ timeout: 10000 });
     await humanClick(page, trigger);
 
     jobLog(job, "Waiting for popup content to render...");
@@ -2207,6 +2212,9 @@ async function attemptCampsiteBooking(
 
 // ---- Sign in helper ----
 
+const SIGN_IN_MAX_RETRIES = 3;
+const SIGN_IN_RETRY_DELAY_MS = 5000;
+
 async function signIn(
   page: Page,
   email: string,
@@ -2214,9 +2222,31 @@ async function signIn(
 ): Promise<void> {
   console.log("[sniper] Signing in...");
 
+  let lastErr: Error | null = null;
+  for (let attempt = 1; attempt <= SIGN_IN_MAX_RETRIES; attempt++) {
+    try {
+      await signInAttempt(page, email, password);
+      return;
+    } catch (err) {
+      lastErr = err instanceof Error ? err : new Error(String(err));
+      const msg = lastErr.message.slice(0, 120);
+      if (attempt < SIGN_IN_MAX_RETRIES) {
+        console.log(`[sniper] Sign-in attempt ${attempt}/${SIGN_IN_MAX_RETRIES} failed: ${msg}. Retrying in ${SIGN_IN_RETRY_DELAY_MS / 1000}s...`);
+        await page.waitForTimeout(SIGN_IN_RETRY_DELAY_MS);
+      }
+    }
+  }
+  throw lastErr ?? new Error("Sign-in failed after retries.");
+}
+
+async function signInAttempt(
+  page: Page,
+  email: string,
+  password: string,
+): Promise<void> {
   // Visit homepage first to warm cookies/session like a real user
-  const maxRetries = 3;
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+  const maxNavRetries = 3;
+  for (let attempt = 1; attempt <= maxNavRetries; attempt++) {
     try {
       await page.goto("https://www.recreation.gov/", {
         waitUntil: "domcontentloaded",
@@ -2225,8 +2255,8 @@ async function signIn(
       break;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (attempt < maxRetries && (msg.includes("ERR_HTTP_RESPONSE_CODE_FAILURE") || msg.includes("ERR_TIMED_OUT") || msg.includes("ERR_CONNECTION"))) {
-        console.log(`[sniper] Homepage load failed (attempt ${attempt}/${maxRetries}): ${msg.slice(0, 100)}. Retrying in ${attempt * 3}s...`);
+      if (attempt < maxNavRetries && (msg.includes("ERR_HTTP_RESPONSE_CODE_FAILURE") || msg.includes("ERR_TIMED_OUT") || msg.includes("ERR_CONNECTION"))) {
+        console.log(`[sniper] Homepage load failed (attempt ${attempt}/${maxNavRetries}): ${msg.slice(0, 100)}. Retrying in ${attempt * 3}s...`);
         await page.waitForTimeout(attempt * 3000);
         continue;
       }
@@ -2239,7 +2269,7 @@ async function signIn(
   await simulateBrowsing(page);
 
   // Navigate to login page
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+  for (let attempt = 1; attempt <= maxNavRetries; attempt++) {
     try {
       await page.goto("https://www.recreation.gov/log-in", {
         waitUntil: "domcontentloaded",
@@ -2248,8 +2278,8 @@ async function signIn(
       break;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (attempt < maxRetries && (msg.includes("ERR_HTTP_RESPONSE_CODE_FAILURE") || msg.includes("ERR_TIMED_OUT") || msg.includes("ERR_CONNECTION"))) {
-        console.log(`[sniper] Sign-in page load failed (attempt ${attempt}/${maxRetries}): ${msg.slice(0, 100)}. Retrying in ${attempt * 3}s...`);
+      if (attempt < maxNavRetries && (msg.includes("ERR_HTTP_RESPONSE_CODE_FAILURE") || msg.includes("ERR_TIMED_OUT") || msg.includes("ERR_CONNECTION"))) {
+        console.log(`[sniper] Sign-in page load failed (attempt ${attempt}/${maxNavRetries}): ${msg.slice(0, 100)}. Retrying in ${attempt * 3}s...`);
         await page.waitForTimeout(attempt * 3000);
         continue;
       }
