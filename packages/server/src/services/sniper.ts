@@ -1399,6 +1399,59 @@ async function dismissTrafficModal(
   return true;
 }
 
+// ---- Cart expiry modal handler ----
+
+const CART_EXPIRY_CHECK_INTERVAL_MS = 60_000; // Check every 60 seconds
+
+/**
+ * Recreation.gov shows "Your cart is about to expire" modal with "Add Five Minutes" button.
+ * Detects it and clicks to extend cart time. Returns true if modal was found and dismissed.
+ */
+async function dismissCartExpiryModalIfPresent(
+  page: Page,
+  job: SniperJob,
+): Promise<boolean> {
+  try {
+    const modal = page.locator(
+      '.sarsa-modal-content-body:has-text("Your cart is about to expire")',
+    );
+    const isVisible = await modal.isVisible({ timeout: 500 }).catch(() => false);
+    if (!isVisible) return false;
+
+    jobLog(job, "Cart expiry modal detected. Clicking Add Five Minutes...");
+    await saveScreenshot(page, job, "cart-expiry-modal-before");
+
+    const addMinutesBtn = modal.locator('button:has-text("Add Five Minutes")');
+    await addMinutesBtn.click({ timeout: 5000 });
+    await page.waitForTimeout(500);
+
+    jobLog(job, "Cart extended by 5 minutes.");
+    await saveScreenshot(page, job, "cart-expiry-modal-dismissed");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Start a periodic check for the cart expiry modal and dismiss it when present.
+ * Call the returned function to stop the interval.
+ */
+function startCartExpiryWatcher(
+  page: Page,
+  job: SniperJob,
+): () => void {
+  const interval = setInterval(async () => {
+    try {
+      await dismissCartExpiryModalIfPresent(page, job);
+    } catch {
+      // Ignore errors in background check
+    }
+  }, CART_EXPIRY_CHECK_INTERVAL_MS);
+
+  return () => clearInterval(interval);
+}
+
 /**
  * Navigate to a URL, handle the traffic modal, and detect 404-style pages.
  * Recreation.gov is a SPA so HTTP status is always 200, but 404 pages contain
@@ -1891,7 +1944,11 @@ async function fillOrderDetails(page: Page, job: SniperJob): Promise<boolean> {
     return false;
   }
 
+  const stopCartExpiryWatcher = startCartExpiryWatcher(page, job);
+
   try {
+    await dismissCartExpiryModalIfPresent(page, job);
+
     // Check for abnormal activity error before waiting for form
     if (await hasAbnormalActivityError(page)) {
       jobLog(job, "Abnormal activity error detected on order details page.");
@@ -1955,6 +2012,8 @@ async function fillOrderDetails(page: Page, job: SniperJob): Promise<boolean> {
     jobLog(job, "Error filling order details:", msg);
     await saveScreenshot(page, job, "order-details-error");
     return false;
+  } finally {
+    stopCartExpiryWatcher();
   }
 }
 

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, type FormEvent } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef, type FormEvent } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
   createSniperJob,
@@ -139,6 +139,79 @@ export default function SniperPage() {
 
 const selectClasses = "w-full px-3 py-2 border border-stone-600 rounded-lg bg-stone-900 text-stone-100 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500";
 const inputClasses = selectClasses;
+
+const MANUAL_PERMIT_DEBOUNCE_MS = 400;
+
+function ManualPermitIdInput({
+  permitId,
+  permitOptions,
+  permits,
+  onPermitChange,
+  onManualPermitChange,
+  inputClasses,
+}: {
+  permitId: string;
+  permitOptions: { value: string; label: string }[];
+  permits: PermitSummary[];
+  onPermitChange: (fid: string) => void;
+  onManualPermitChange: (fid: string, name: string) => void;
+  inputClasses: string;
+}) {
+  const [localValue, setLocalValue] = useState("");
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const isManualEntry = permitId && !permitOptions.some((o) => o.value === permitId);
+
+  useEffect(() => {
+    if (isManualEntry && localValue !== permitId) {
+      setLocalValue(permitId);
+    } else if (!isManualEntry && localValue) {
+      setLocalValue("");
+    }
+  }, [isManualEntry, permitId, localValue]);
+
+  return (
+    <div className="mt-2">
+      <label className="block text-xs text-stone-500 mb-0.5">
+        Or enter permit ID manually (e.g. 621745) — entry points will load from recreation.gov
+      </label>
+      <input
+        type="text"
+        placeholder="Permit ID from recreation.gov URL"
+        value={localValue}
+        onChange={(e) => {
+          const v = e.target.value.trim();
+          setLocalValue(e.target.value.trim());
+          if (debounceRef.current) clearTimeout(debounceRef.current);
+          if (v) {
+            debounceRef.current = setTimeout(() => {
+              debounceRef.current = null;
+              onManualPermitChange(v, permits.find((p) => p.facilityId === v)?.name || `Permit ${v}`);
+            }, MANUAL_PERMIT_DEBOUNCE_MS);
+          } else {
+            debounceRef.current = setTimeout(() => {
+              debounceRef.current = null;
+              onPermitChange("");
+            }, MANUAL_PERMIT_DEBOUNCE_MS);
+          }
+        }}
+        onBlur={() => {
+          if (debounceRef.current) {
+            clearTimeout(debounceRef.current);
+            debounceRef.current = null;
+            const v = localValue.trim();
+            if (v) {
+              onManualPermitChange(v, permits.find((p) => p.facilityId === v)?.name || `Permit ${v}`);
+            } else {
+              onPermitChange("");
+            }
+          }
+        }}
+        className={`w-full mt-0.5 ${inputClasses} text-sm placeholder-stone-500`}
+      />
+    </div>
+  );
+}
 
 function SniperForm({
   defaultPermitId,
@@ -546,6 +619,21 @@ function SniperForm({
               {permitId && (
                 <p className="mt-1 text-xs text-stone-500">ID: {permitId}</p>
               )}
+              <ManualPermitIdInput
+                permitId={permitId}
+                permitOptions={permitOptions}
+                permits={permits}
+                onPermitChange={handlePermitChange}
+                onManualPermitChange={(fid, name) => {
+                  setPermitId(fid);
+                  setPermitName(name);
+                  setDivisionId("");
+                  setStartingArea("");
+                  setTrailheadName("");
+                  setTrailheadDivisionId("");
+                }}
+                inputClasses={inputClasses}
+              />
             </div>
 
             {permitId && !loadingStartingAreas && startingAreaInfo?.hasStartingAreas ? (
