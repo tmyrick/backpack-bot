@@ -487,7 +487,7 @@ async function runPermitSniperJob(job: SniperJob): Promise<void> {
         });
         await saveJobs();
 
-        const result = await attemptBrowserBooking(page, job, fallbackRange);
+        const result = await attemptBrowserBooking(page, job, fallbackRange, creds);
         if (result === "booked") {
           updateJob(job, {
             status: "in-cart",
@@ -514,7 +514,7 @@ async function runPermitSniperJob(job: SniperJob): Promise<void> {
     });
     await saveJobs();
 
-    const bookResult = await attemptBrowserBooking(page, job, foundRange);
+    const bookResult = await attemptBrowserBooking(page, job, foundRange, creds);
 
     if (bookResult === "booked") {
       updateJob(job, {
@@ -548,7 +548,7 @@ async function runPermitSniperJob(job: SniperJob): Promise<void> {
         message: `Primary range taken. Trying fallback: ${fallbackRange.startDate} - ${fallbackRange.endDate}...`,
       });
 
-      const result = await attemptBrowserBooking(page, job, fallbackRange);
+      const result = await attemptBrowserBooking(page, job, fallbackRange, creds);
       if (result === "booked") {
         updateJob(job, {
           status: "in-cart",
@@ -736,7 +736,7 @@ async function runCampsiteSniperJob(job: SniperJob): Promise<void> {
       });
       await saveJobs();
 
-      const bookResult = await attemptBrowserBooking(page, job, foundRange);
+      const bookResult = await attemptBrowserBooking(page, job, foundRange, creds);
 
       if (bookResult === "booked") {
         updateJob(job, {
@@ -760,7 +760,7 @@ async function runCampsiteSniperJob(job: SniperJob): Promise<void> {
         updateJob(job, {
           message: `Primary range taken. Trying fallback: ${fallbackRange.startDate} - ${fallbackRange.endDate}...`,
         });
-        const result = await attemptBrowserBooking(page, job, fallbackRange);
+        const result = await attemptBrowserBooking(page, job, fallbackRange, creds);
         if (result === "booked") {
           updateJob(job, {
             status: "in-cart",
@@ -827,7 +827,7 @@ async function runCampsiteSniperJob(job: SniperJob): Promise<void> {
       });
       await saveJobs();
 
-      const bookResult = await attemptCampsiteBooking(page, job, found.range, found.campsiteId);
+      const bookResult = await attemptCampsiteBooking(page, job, found.range, found.campsiteId, creds);
 
       if (bookResult === "booked") {
         updateJob(job, {
@@ -858,7 +858,7 @@ async function runCampsiteSniperJob(job: SniperJob): Promise<void> {
           message: `Primary range taken. Trying fallback: ${fallbackRange.startDate} - ${fallbackRange.endDate} on site ${fallback.siteName}...`,
         });
 
-        const result = await attemptCampsiteBooking(page, job, fallbackRange, fallback.campsiteId);
+        const result = await attemptCampsiteBooking(page, job, fallbackRange, fallback.campsiteId, creds);
         if (result === "booked") {
           updateJob(job, {
             status: "in-cart",
@@ -1202,6 +1202,47 @@ async function saveScreenshot(
 }
 
 /**
+ * Check if the user appears to be logged in (User button in header visible).
+ */
+async function isLoggedIn(page: Page): Promise<boolean> {
+  return page.locator('[aria-label^="User:"]').first().isVisible({ timeout: 2000 }).catch(() => false);
+}
+
+/**
+ * Ensure we're logged in. If not, sign in and optionally navigate to resumeUrl.
+ * Returns true if we had to re-authenticate (caller may need to retry/restore state).
+ */
+async function ensureLoggedIn(
+  page: Page,
+  job: SniperJob,
+  creds: { email: string; password: string },
+  opts?: { resumeUrl?: string },
+): Promise<boolean> {
+  if (await isLoggedIn(page)) return false;
+
+  jobLog(job, "Session expired detected. Re-authenticating...");
+  await saveScreenshot(page, job, "session-expired-before-reauth");
+
+  try {
+    await signIn(page, creds.email, creds.password, job);
+    jobLog(job, "Re-authentication succeeded.");
+    await saveScreenshot(page, job, "reauth-success");
+
+    if (opts?.resumeUrl) {
+      jobLog(job, "Resuming at:", opts.resumeUrl);
+      await safeGoto(page, job, opts.resumeUrl, "resume-after-reauth");
+      await page.waitForTimeout(humanDelay(300, 600));
+    }
+    return true;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    jobLog(job, "Re-authentication failed:", msg);
+    await saveScreenshot(page, job, "reauth-failed");
+    throw err;
+  }
+}
+
+/**
  * Detect a login modal/form that recreation.gov shows when the session expires.
  * Instead of trying to re-auth inside the unreliable modal, navigates to the
  * full login page and uses the proven signIn() flow.
@@ -1453,6 +1494,21 @@ async function runCartKeepAliveCycle(
     const url = page.url();
     if (!url.includes("/cart")) {
       jobLog(job, "Cart keep-alive: not on cart page, skipping.");
+      return false;
+    }
+
+    // Defensive: session may have expired during cart wait
+    try {
+      const creds = getRecgovCredentials();
+      const reAuthed = await ensureLoggedIn(page, job, creds, {
+        resumeUrl: "https://www.recreation.gov/cart",
+      });
+      if (reAuthed) {
+        jobLog(job, "Cart keep-alive: re-authenticated, resuming on cart.");
+        await page.waitForTimeout(humanDelay(500, 1000));
+      }
+    } catch (err) {
+      jobLog(job, "Cart keep-alive: ensureLoggedIn failed:", err instanceof Error ? err.message : err);
       return false;
     }
 
@@ -1783,13 +1839,22 @@ async function attemptBrowserBooking(
   page: Page,
   job: SniperJob,
   targetRange: DateRange,
+  creds: { email: string; password: string },
 ): Promise<"booked" | "failed"> {
   try {
     const facilityId = job.permitId || job.campgroundId;
-    const url = `https://www.recreation.gov/permits/${facilityId}/registration/detailed-availability?date=${targetRange.startDate}&type=overnight`;
-    jobLog(job, "Navigating to:", url);
+    const permitUrl = `https://www.recreation.gov/permits/${facilityId}/registration/detailed-availability?date=${targetRange.startDate}&type=overnight`;
+
+    // Defensive: detect session expiry and re-auth before proceeding
+    const reAuthed = await ensureLoggedIn(page, job, creds, { resumeUrl: permitUrl });
+    if (reAuthed) {
+      jobLog(job, "Re-authenticated. Proceeding with booking from permit page.");
+      await page.waitForTimeout(humanDelay(300, 600));
+    }
+
+    jobLog(job, "Navigating to:", permitUrl);
     await logStepTiming(job, "goto booking page + hydrate", async () => {
-      await safeGoto(page, job, url, "booking-page-loaded-nav");
+      await safeGoto(page, job, permitUrl, "booking-page-loaded-nav");
       await page.waitForTimeout(humanDelay(150, 350));
     });
 
@@ -2068,17 +2133,63 @@ async function attemptBrowserBooking(
       }
     }
 
-    let orderSuccess = false;
-    await logStepTiming(job, "fill order details + proceed to cart", async () => {
-      orderSuccess = await fillOrderDetails(page, job);
-    });
-    if (orderSuccess) {
-      jobLog(job, "Order details filled and proceeded to cart!");
-      return "booked";
-    } else {
-      jobLog(job, "Order details filling failed — item may be in cart but not completed. Check browser.");
-      return "failed";
+    let orderResult: boolean | "retry" = false;
+    const maxOrderDetailsRetries = 2;
+    for (let orderRetry = 0; orderRetry < maxOrderDetailsRetries; orderRetry++) {
+      if (orderRetry > 0) {
+        jobLog(job, `Session expired during order details. Retrying from permit page (attempt ${orderRetry + 1}/${maxOrderDetailsRetries})...`);
+        await safeGoto(page, job, permitUrl, "retry-order-details-nav");
+        await page.waitForTimeout(humanDelay(150, 350));
+        await setGroupSize(page, job);
+        if (job.startingArea) await clickStartingAreaFilter(page, job);
+        await page.waitForTimeout(humanDelay(150, 300));
+        const retryNightDates = expandRange(targetRange);
+        let retryClickCount = 0;
+        for (const nightDate of retryNightDates) {
+          const d = new Date(nightDate + "T00:00:00");
+          const monthName = d.toLocaleString("en-US", { month: "long", timeZone: "UTC" });
+          const dayOfMonth = d.getUTCDate();
+          const year = d.getUTCFullYear();
+          const ariaDateStr = `${monthName} ${dayOfMonth}, ${year}`;
+          const selector = job.trailheadName
+            ? `button.rec-availability-date[aria-label*="${job.trailheadName}"][aria-label*="${ariaDateStr}"][aria-label*="Available"]:not([disabled])`
+            : `button.rec-availability-date[aria-label*="${ariaDateStr}"][aria-label*="Available"]:not([disabled])`;
+          const cells = page.locator(selector);
+          if ((await cells.count()) > 0) {
+            await humanClick(page, cells);
+            retryClickCount++;
+            await page.waitForTimeout(50);
+          }
+        }
+        if (retryClickCount === 0) {
+          jobLog(job, "[order retry] No date cells found.");
+          return "failed";
+        }
+        const retryBookBtn = page.locator('button:has-text("Book Now")');
+        if ((await retryBookBtn.count()) > 0) {
+          await humanClick(page, retryBookBtn);
+          await page.waitForTimeout(600);
+        }
+        const stillLoginNeeded = await handleLoginModal(page, job);
+        if (stillLoginNeeded) {
+          jobLog(job, "[order retry] Login modal appeared again.");
+          continue;
+        }
+      }
+      orderResult = await logStepTiming(job, "fill order details + proceed to cart", () =>
+        fillOrderDetails(page, job),
+      );
+      if (orderResult === true) {
+        jobLog(job, "Order details filled and proceeded to cart!");
+        return "booked";
+      }
+      if (orderResult !== "retry") {
+        jobLog(job, "Order details filling failed — item may be in cart but not completed. Check browser.");
+        return "failed";
+      }
     }
+    jobLog(job, "Order details retry exhausted.");
+    return "failed";
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     jobLog(job, "attemptBrowserBooking error:", msg);
@@ -2106,8 +2217,15 @@ async function attemptBrowserBooking(
  *   Terms:    input#need-to-know-checkbox
  *   Submit:   button[data-testid="OrderDetailsSummary-cart-btn"] "Proceed to Cart"
  */
-async function fillOrderDetails(page: Page, job: SniperJob): Promise<boolean> {
+async function fillOrderDetails(page: Page, job: SniperJob): Promise<boolean | "retry"> {
   jobLog(job, "Filling order details...");
+
+  // Defensive: session may have expired while on order details
+  const loginNeeded = await handleLoginModal(page, job);
+  if (loginNeeded) {
+    jobLog(job, "Session expired during order details. Caller should retry from permit page.");
+    return "retry";
+  }
 
   const address = process.env.RECGOV_ADDRESS;
   const city = process.env.RECGOV_CITY;
@@ -2201,10 +2319,19 @@ async function attemptCampsiteBooking(
   job: SniperJob,
   targetRange: DateRange,
   targetCampsiteId: string,
+  creds: { email: string; password: string },
 ): Promise<"booked" | "failed"> {
   try {
     // Try permits path first, fall back to campgrounds path
     let url = `https://www.recreation.gov/permits/${job.campgroundId}/registration/detailed-availability?date=${targetRange.startDate}&type=overnight`;
+
+    // Defensive: detect session expiry and re-auth before proceeding
+    const reAuthed = await ensureLoggedIn(page, job, creds, { resumeUrl: url });
+    if (reAuthed) {
+      jobLog(job, "Re-authenticated. Proceeding with campsite booking from facility page.");
+      await page.waitForTimeout(humanDelay(300, 600));
+    }
+
     jobLog(job, "Navigating to:", url);
     let navRes = await logStepTiming(job, "goto facility page + hydrate", async () => {
       const r = await safeGoto(page, job, url, "campground-page-loaded");
@@ -2360,18 +2487,18 @@ async function attemptCampsiteBooking(
     await saveScreenshot(page, job, "campsite-after-book-click");
 
     // Fill order details (same form as permits)
-    let orderSuccess = false;
-    await logStepTiming(job, "fill order details + proceed to cart", async () => {
-      orderSuccess = await fillOrderDetails(page, job);
-    });
-
-    if (orderSuccess) {
+    const orderResult = await logStepTiming(job, "fill order details + proceed to cart", () =>
+      fillOrderDetails(page, job),
+    );
+    if (orderResult === true) {
       jobLog(job, "Campsite order details filled and proceeded to cart!");
       return "booked";
-    } else {
-      jobLog(job, "Order details filling failed — item may be in cart but not completed.");
-      return "failed";
     }
+    if (orderResult === "retry") {
+      jobLog(job, "Session expired during order details. Campsite booking would need full retry.");
+    }
+    jobLog(job, "Order details filling failed — item may be in cart but not completed.");
+    return "failed";
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     jobLog(job, "attemptCampsiteBooking error:", msg);
