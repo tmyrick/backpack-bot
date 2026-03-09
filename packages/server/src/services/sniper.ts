@@ -1491,17 +1491,33 @@ async function runCartKeepAliveCycle(
   job: SniperJob,
 ): Promise<boolean> {
   try {
-    const url = page.url();
+    const CART_URL = "https://www.recreation.gov/cart";
+    let url = page.url();
     if (!url.includes("/cart")) {
-      jobLog(job, "Cart keep-alive: not on cart page, skipping.");
-      return false;
+      jobLog(job, "Cart keep-alive: not on cart page, navigating back...");
+      try {
+        const creds = getRecgovCredentials();
+        await ensureLoggedIn(page, job, creds, { resumeUrl: CART_URL });
+        if (!page.url().includes("/cart")) {
+          await safeGoto(page, job, CART_URL, "cart-keepalive-resume");
+        }
+        await page.waitForTimeout(humanDelay(500, 1000));
+        url = page.url();
+      } catch (err) {
+        jobLog(job, "Cart keep-alive: failed to navigate to cart:", err instanceof Error ? err.message : err);
+        return false;
+      }
+      if (!url.includes("/cart")) {
+        jobLog(job, "Cart keep-alive: still not on cart after navigate, skipping.");
+        return false;
+      }
     }
 
     // Defensive: session may have expired during cart wait
     try {
       const creds = getRecgovCredentials();
       const reAuthed = await ensureLoggedIn(page, job, creds, {
-        resumeUrl: "https://www.recreation.gov/cart",
+        resumeUrl: CART_URL,
       });
       if (reAuthed) {
         jobLog(job, "Cart keep-alive: re-authenticated, resuming on cart.");
@@ -1544,12 +1560,19 @@ async function runCartKeepAliveCycle(
     await humanClick(page, orderDetailsBtn);
     await page.waitForTimeout(1500);
 
-    const backOnCart = page.url().includes("/cart");
+    let backOnCart = page.url().includes("/cart");
     if (backOnCart) {
       jobLog(job, "Cart keep-alive: back on cart. Timer reset.");
       await saveScreenshot(page, job, "cart-keepalive-done");
     } else {
       jobLog(job, "Cart keep-alive: may not have returned to cart. URL:", page.url());
+      jobLog(job, "Cart keep-alive: navigating back to cart...");
+      try {
+        await safeGoto(page, job, CART_URL, "cart-keepalive-recovery");
+        backOnCart = page.url().includes("/cart");
+      } catch {
+        /* ignore */
+      }
     }
     return backOnCart;
   } catch (err) {
