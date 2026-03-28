@@ -1,4 +1,4 @@
-import { firefox, type Browser, type BrowserContext, type Page } from "playwright";
+import { firefox, type Browser, type BrowserContext, type Locator, type Page } from "playwright";
 import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
@@ -33,6 +33,8 @@ const JOBS_FILE = path.join(DATA_DIR, "sniper-jobs.json");
 const SCREENSHOTS_DIR = path.join(DATA_DIR, "screenshots");
 
 const PRE_WARM_LEAD_MS = 2 * 60 * 1000; // 2 minutes before window
+/** After wall-clock window time, wait this long before reload + browser booking (inventory flip on server). */
+const POST_WINDOW_BEFORE_RELOAD_MS = 2_000;
 const POLL_INTERVAL_MS = 4_000; // 4 seconds base — jittered in practice
 const MAX_WATCH_DURATION_MS = 60 * 1000; // 60 seconds of polling
 const RECGOV_API = "https://www.recreation.gov/api/permits";
@@ -71,7 +73,16 @@ async function launchStealthBrowser(): Promise<{ browser: Browser; context: Brow
     headless,
     ...(proxyConfig ? { proxy: proxyConfig } : {}),
   });
-  console.log("[sniper] Launched Firefox" + (headless ? " (headless)" : " (headed)") + (proxyServer ? " via proxy" : ""));
+  const headed = !headless;
+  const visualClicks =
+    headed &&
+    (process.env.VISUAL_CLICKS === "true" || process.env.VISUAL_CLICKS === "1");
+  console.log(
+    "[sniper] Launched Firefox" +
+      (headless ? " (headless)" : " (headed)") +
+      (proxyServer ? " via proxy" : "") +
+      (visualClicks ? " (VISUAL_CLICKS pulse on clicks)" : ""),
+  );
 
   const context = await browser.newContext({
     userAgent: FIREFOX_UA,
@@ -414,10 +425,48 @@ async function runPermitSniperJob(job: SniperJob): Promise<void> {
 
     if (signal.aborted) return;
 
-    // ---- Phase 2: Watch (poll availability API) ----
+    // ---- Phase 2a: Window just opened — brief settle, then refresh UI and book (don't wait on API first) ----
     updateJob(job, {
       status: "watching",
-      message: "Window open! Polling for availability...",
+      message: `Window open! Waiting ${POST_WINDOW_BEFORE_RELOAD_MS / 1000}s, then reloading and booking in the browser...`,
+    });
+    await saveJobs();
+    await sleep(POST_WINDOW_BEFORE_RELOAD_MS, signal);
+    if (signal.aborted) return;
+
+    jobLog(job, "Post-window: reloading detailed availability for a fresh grid (API poll runs after this if needed).");
+    try {
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 30_000 });
+      await dismissOutdatedBrowserBanner(page);
+      await page.waitForTimeout(humanDelay(150, 350));
+    } catch (err) {
+      jobLog(job, "Post-window reload failed:", err instanceof Error ? err.message : err);
+    }
+
+    for (const immediateRange of job.desiredDateRanges) {
+      if (signal.aborted) return;
+      updateJob(job, {
+        status: "booking",
+        message: `Trying ${immediateRange.startDate} - ${immediateRange.endDate} in browser right after window open...`,
+      });
+      await saveJobs();
+      const immediateResult = await attemptBrowserBooking(page, job, immediateRange, creds);
+      if (immediateResult === "booked") {
+        updateJob(job, {
+          status: "in-cart",
+          bookedRange: immediateRange,
+          message: `Permit for ${immediateRange.startDate} - ${immediateRange.endDate} added to cart! Complete your purchase on recreation.gov.`,
+        });
+        await saveJobs();
+        return;
+      }
+    }
+
+    jobLog(job, "Immediate post-window browser attempt(s) did not finish booking; polling availability API with retries...");
+
+    // ---- Phase 2b: Watch (poll availability API) ----
+    updateJob(job, {
+      message: "Polling for availability (browser will retry when API sees openings)...",
     });
     await saveJobs();
 
@@ -679,13 +728,57 @@ async function runCampsiteSniperJob(job: SniperJob): Promise<void> {
     // ---- Phase 2: Watch (poll campsite availability API) ----
     updateJob(job, {
       status: "watching",
-      message: "Window open! Polling campsite availability...",
+      message: job.campgroundIsPermit
+        ? "Window open! Reloading and trying the browser first..."
+        : "Window open! Polling campsite availability...",
     });
     await saveJobs();
 
     const watchDeadline = Date.now() + MAX_WATCH_DURATION_MS;
 
     if (job.campgroundIsPermit) {
+      updateJob(job, {
+        message: `Window open! Waiting ${POST_WINDOW_BEFORE_RELOAD_MS / 1000}s, then reloading and booking...`,
+      });
+      await saveJobs();
+      await sleep(POST_WINDOW_BEFORE_RELOAD_MS, signal);
+      if (signal.aborted) return;
+
+      jobLog(job, "Post-window: reloading permit-style facility page before first browser booking attempt.");
+      try {
+        await page.reload({ waitUntil: "domcontentloaded", timeout: 30_000 });
+        await dismissOutdatedBrowserBanner(page);
+        await page.waitForTimeout(humanDelay(150, 350));
+      } catch (err) {
+        jobLog(job, "Post-window reload failed:", err instanceof Error ? err.message : err);
+      }
+
+      for (const immediateRange of job.desiredDateRanges) {
+        if (signal.aborted) return;
+        updateJob(job, {
+          status: "booking",
+          message: `Trying ${immediateRange.startDate} - ${immediateRange.endDate} in browser right after window open...`,
+        });
+        await saveJobs();
+        const immediateResult = await attemptBrowserBooking(page, job, immediateRange, creds);
+        if (immediateResult === "booked") {
+          updateJob(job, {
+            status: "in-cart",
+            bookedRange: immediateRange,
+            message: `${job.campgroundName} for ${immediateRange.startDate} - ${immediateRange.endDate} added to cart! Complete your purchase on recreation.gov.`,
+          });
+          await saveJobs();
+          return;
+        }
+      }
+
+      jobLog(job, "Immediate post-window browser attempt(s) did not finish booking; polling permit availability API...");
+
+      updateJob(job, {
+        message: "Polling for availability (browser will retry when API sees openings)...",
+      });
+      await saveJobs();
+
       // ---- Permit-type facility: use permit availability API ----
       let foundRange: DateRange | null = null;
 
@@ -920,6 +1013,24 @@ function expandRange(range: DateRange): string[] {
     current.setUTCDate(current.getUTCDate() + 1);
   }
   return dates;
+}
+
+/**
+ * Dates to click in the permit grid. Production: every night in [startDate, endDate).
+ * VISUAL_CLICKS: the range's startDate and endDate columns (as the user picked them), not interior nights —
+ * e.g. Fri–Sun with endDate Sunday clicks Friday then Sunday, not Saturday.
+ */
+function nightsToClickInBrowser(range: DateRange): string[] {
+  if (!visualClicksEnabled()) {
+    return expandRange(range);
+  }
+  if (!range.startDate) {
+    return expandRange(range);
+  }
+  if (!range.endDate || range.startDate >= range.endDate) {
+    return [range.startDate];
+  }
+  return [range.startDate, range.endDate];
 }
 
 /**
@@ -1310,19 +1421,437 @@ function jitteredPollInterval(): number {
   return Math.floor(POLL_INTERVAL_MS + (Math.random() * 2 - 1) * jitter);
 }
 
+function visualClicksEnabled(): boolean {
+  const headed = process.env.HEADLESS === "false" || process.env.HEADLESS === "0";
+  const want = process.env.VISUAL_CLICKS === "true" || process.env.VISUAL_CLICKS === "1";
+  return headed && want;
+}
+
+/** Normal runs exclude disabled cells; headed VISUAL_CLICKS includes them so pulses and click attempts can run for debugging. */
+function dateCellDisabledSelectorClause(): string {
+  return visualClicksEnabled() ? "" : ":not([disabled])";
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function recAvailabilityButtonLocator(page: Page): ReturnType<Page["locator"]> {
+  return visualClicksEnabled()
+    ? page.locator("button.rec-availability-date")
+    : page.locator("button.rec-availability-date:not([disabled])");
+}
+
+type RecDateAttempt = {
+  trail: string | null;
+  requireAvailableInName: boolean;
+  recClassOnly: boolean;
+  label: string;
+};
+
+/**
+ * Production: recreation.gov uses `{Trail} on March 20, 2026 - Available|Unavailable`. Matching `(?=.*Available)`
+ * wrongly matches inside "Unavailable". We require ` - Available` instead.
+ *
+ * VISUAL_CLICKS: only trail + date or date alone — ignore - Available / - Unavailable for headed debugging.
+ */
+function buildRecDateAttempts(job: SniperJob, rowTrailOverride?: string): RecDateAttempt[] {
+  const attempts: RecDateAttempt[] = [];
+  const th =
+    rowTrailOverride !== undefined ? rowTrailOverride.trim() || undefined : job.trailheadName?.trim();
+
+  if (visualClicksEnabled()) {
+    if (th) {
+      attempts.push({
+        trail: th,
+        requireAvailableInName: false,
+        recClassOnly: true,
+        label: `VISUAL: trailhead "${th}" + date (ignores - Available / - Unavailable; no other-row fallback)`,
+      });
+    } else {
+      attempts.push({
+        trail: null,
+        requireAvailableInName: false,
+        recClassOnly: true,
+        label: "VISUAL: first .rec-availability-date for this date (Olympic filter only; no generic-button fallback)",
+      });
+    }
+    return attempts;
+  }
+
+  if (th) {
+    attempts.push({
+      trail: th,
+      requireAvailableInName: true,
+      recClassOnly: true,
+      label: `trailhead "${th}" + date + " - Available"`,
+    });
+  }
+  attempts.push({
+    trail: null,
+    requireAvailableInName: true,
+    recClassOnly: true,
+    label: th ? 'any row: date + " - Available"' : 'first row: date + " - Available"',
+  });
+  attempts.push({
+    trail: null,
+    requireAvailableInName: false,
+    recClassOnly: false,
+    label: "fallback: any enabled button whose name contains the date",
+  });
+  return attempts;
+}
+
+function locatorForRecDateAttempt(page: Page, ariaDateStr: string, attempt: RecDateAttempt): Locator {
+  const dt = escapeRegExp(ariaDateStr);
+  const parts = [`(?=.*${dt})`];
+  if (attempt.trail) parts.push(`(?=.*${escapeRegExp(attempt.trail)})`);
+  if (attempt.requireAvailableInName) parts.push(`(?=.*\\s-\\sAvailable)`);
+  const pattern = new RegExp(parts.join(""), "i");
+  const byName = page.getByRole("button", { name: pattern });
+  if (attempt.recClassOnly) {
+    return recAvailabilityButtonLocator(page).and(byName);
+  }
+  const base = visualClicksEnabled() ? page.locator("button") : page.locator("button:not([disabled])");
+  return base.and(byName);
+}
+
+async function logAriaSamplesForRecDateButtons(
+  page: Page,
+  job: SniperJob,
+  ariaDateStr: string,
+  logPrefix: string,
+): Promise<void> {
+  const labels = (await page.evaluate(
+    `((needle) => {
+      var buttons = Array.from(document.querySelectorAll("button.rec-availability-date"));
+      return buttons
+        .map(function (b) { return (b.getAttribute("aria-label") || "").trim(); })
+        .filter(function (t) { return t.length > 0; })
+        .filter(function (t) { return t.toLowerCase().indexOf(String(needle).toLowerCase()) !== -1; })
+        .slice(0, 14);
+    })(${JSON.stringify(ariaDateStr)})`,
+  )) as string[];
+  jobLog(
+    job,
+    `${logPrefix}Sample .rec-availability-date aria-labels mentioning "${ariaDateStr}" (${labels.length} shown):`,
+    labels.length ? labels : "(none — label text may differ or grid not loaded)",
+  );
+}
+
+/** Trailhead names from data rows (Olympic detailed grid), DOM order. */
+async function listDetailedGridTrailheadNames(page: Page): Promise<string[]> {
+  const names = (await page.evaluate(`(() => {
+    var grid = document.querySelector('[aria-label="Availability by Trailhead and Dates"]')
+      || document.querySelector(".detailed-availability-grid-new");
+    if (!grid) return [];
+    var rows = grid.querySelectorAll('[data-testid="Row"]');
+    var out = [];
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      if (row.querySelector("[data-testid=sortable-table-column-header]")) continue;
+      var cell = row.querySelector('[data-testid="grid-cell"]');
+      if (!cell) continue;
+      var content = cell.querySelector(".sarsa-button-content");
+      var name = (content && content.textContent ? content.textContent : cell.textContent || "").trim();
+      if (name && out.indexOf(name) === -1) out.push(name);
+    }
+    return out;
+  })()`)) as string[];
+  return names;
+}
+
+/**
+ * VISUAL: switch Olympic starting-area chips to a filter that shows every trailhead row
+ * (second pass mimics production falling back beyond the selected area).
+ */
+async function visualExpandOlympicToAllRows(page: Page, job: SniperJob): Promise<boolean> {
+  const patterns = [/^all$/i, /^all\s+areas?$/i, /^view\s+all/i, /^all\s+trailheads?$/i];
+  const n = await page.locator("button.olympic-filter-button").count();
+  for (let i = 0; i < n; i++) {
+    const btn = page.locator("button.olympic-filter-button").nth(i);
+    const text = ((await btn.textContent()) || "").replace(/\s+/g, " ").trim();
+    if (!text || !patterns.some((p) => p.test(text))) continue;
+    const pressed = await btn.getAttribute("aria-pressed");
+    if (pressed === "true") {
+      jobLog(
+        job,
+        `VISUAL: "${text}" starting-area control already selected — using current grid as full-row pass.`,
+      );
+      return true;
+    }
+    await clickLoc(page, btn, { timeout: 5000 });
+    await page.waitForTimeout(humanDelay(200, 400));
+    jobLog(job, `VISUAL: selected "${text}" so we can walk every trail row (fallback-style).`);
+    return true;
+  }
+  jobLog(
+    job,
+    'VISUAL: no All / All areas Olympic filter found — only rows visible under the current starting area will be walked.',
+  );
+  return false;
+}
+
+function uniqueStringsPreserveOrder(values: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const v of values) {
+    if (seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
+  }
+  return out;
+}
+
+async function clickDateCellsForPermitBookingOneRow(
+  page: Page,
+  job: SniperJob,
+  nightDates: string[],
+  logPrefix: string,
+  rowTrailOverride?: string,
+): Promise<number> {
+  const attempts = buildRecDateAttempts(job, rowTrailOverride);
+  const visual = visualClicksEnabled();
+  let clickCount = 0;
+
+  for (const nightDate of nightDates) {
+    const d = new Date(nightDate + "T00:00:00");
+    const monthName = d.toLocaleString("en-US", { month: "long", timeZone: "UTC" });
+    const dayOfMonth = d.getUTCDate();
+    const year = d.getUTCFullYear();
+    const ariaDateStr = `${monthName} ${dayOfMonth}, ${year}`;
+
+    jobLog(job, `${logPrefix}Date ${nightDate} — accessible name contains "${ariaDateStr}"`);
+
+    if (clickCount > 0) {
+      await page.waitForTimeout(visual ? humanDelay(100, 300) : 50);
+    }
+
+    let clicked = false;
+    for (const attempt of attempts) {
+      const loc = locatorForRecDateAttempt(page, ariaDateStr, attempt);
+      const n = await loc.count();
+      if (n === 0) continue;
+      jobLog(job, `${logPrefix}  ${attempt.label} — ${n} candidate(s)`);
+      try {
+        await humanClick(page, loc, {
+          timeout: 5000,
+          ...(visual
+            ? { force: true, visualTight: clickCount > 0 }
+            : {}),
+        });
+        clickCount++;
+        clicked = true;
+        jobLog(job, `${logPrefix}  clicked (${clickCount} total for this pass)`);
+        break;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        jobLog(job, `${logPrefix}  ${attempt.label} failed: ${msg}`);
+      }
+    }
+
+    if (!clicked) {
+      jobLog(job, `${logPrefix}  no button clicked for ${nightDate}`);
+      if (!visual && job.trailheadName?.trim()) {
+        await logAriaSamplesForRecDateButtons(page, job, ariaDateStr, logPrefix);
+      }
+    }
+  }
+
+  return clickCount;
+}
+
+/**
+ * Click date cells for permit detailed-availability. Production: one pass using job.trailheadName.
+ * VISUAL_CLICKS: walk every visible row in order (preferred trailhead first), then if job.startingArea
+ * is set, switch the Olympic filter toward “All” when possible and walk remaining rows — production-style
+ * priority first, full fallback demo without stopping early.
+ */
+async function clickDateCellsForPermitBooking(
+  page: Page,
+  job: SniperJob,
+  nightDates: string[],
+  logPrefix = "",
+): Promise<number> {
+  const visual = visualClicksEnabled();
+
+  if (!visual) {
+    if (job.startingArea?.trim() && !job.trailheadName?.trim()) {
+      jobLog(
+        job,
+        `${logPrefix}startingArea is set but trailheadName is empty — only the Olympic filter applies. Each night uses the first matching .rec-availability-date in DOM order. Pick a trailhead in the sniper UI to target that row by name.`,
+      );
+    }
+    return clickDateCellsForPermitBookingOneRow(page, job, nightDates, logPrefix, undefined);
+  }
+
+  const preferTh = job.trailheadName?.trim() || "";
+  const listedFiltered = await listDetailedGridTrailheadNames(page);
+
+  let phaseStartingArea: string[];
+  if (preferTh) {
+    phaseStartingArea = uniqueStringsPreserveOrder([preferTh, ...listedFiltered.filter((r) => r !== preferTh)]);
+  } else {
+    phaseStartingArea = listedFiltered.length > 0 ? [...listedFiltered] : [""];
+  }
+
+  jobLog(
+    job,
+    `${logPrefix}VISUAL: pass 1 — ${job.startingArea?.trim() ? "rows under current starting area" : "all visible rows"} (${phaseStartingArea.length}):`,
+    phaseStartingArea.map((r) => r || "(first column)").join(" → "),
+  );
+
+  let bestPartial = 0;
+  let anyFull = false;
+
+  const runVisualRowWalk = async (rows: string[], phaseTag: string) => {
+    for (let ri = 0; ri < rows.length; ri++) {
+      const rowTrail = rows[ri];
+      jobLog(
+        job,
+        `${logPrefix}VISUAL: ${phaseTag} ${ri + 1}/${rows.length} — row "${rowTrail || "(first column)"}"`,
+      );
+      const count = await clickDateCellsForPermitBookingOneRow(
+        page,
+        job,
+        nightDates,
+        logPrefix,
+        rowTrail === "" ? "" : rowTrail,
+      );
+      bestPartial = Math.max(bestPartial, count);
+      if (count === nightDates.length) {
+        anyFull = true;
+      } else {
+        jobLog(
+          job,
+          `${logPrefix}VISUAL: row incomplete (${count}/${nightDates.length}), continuing to next row...`,
+        );
+      }
+      if (ri < rows.length - 1) {
+        const gapMs =
+          count === nightDates.length ? humanDelay(800, 1000) : humanDelay(50, 120);
+        await page.waitForTimeout(gapMs);
+      }
+    }
+  };
+
+  await runVisualRowWalk(phaseStartingArea, "starting-area / primary order");
+
+  if (job.startingArea?.trim()) {
+    const expanded = await visualExpandOlympicToAllRows(page, job);
+    if (expanded) {
+      const listedAll = await listDetailedGridTrailheadNames(page);
+      const already = new Set(
+        phaseStartingArea.map((r) => r).filter((r) => r.length > 0),
+      );
+      const phaseFallback = listedAll.filter((name) => !already.has(name));
+      if (phaseFallback.length > 0) {
+        jobLog(
+          job,
+          `${logPrefix}VISUAL: pass 2 — fallback rows not in starting-area list (${phaseFallback.length}):`,
+          phaseFallback.join(" → "),
+        );
+        await runVisualRowWalk(phaseFallback, "global fallback");
+      } else {
+        jobLog(
+          job,
+          `${logPrefix}VISUAL: pass 2 — no extra rows after expanding filter (same set as pass 1).`,
+        );
+      }
+    }
+  }
+
+  return anyFull ? nightDates.length : bestPartial;
+}
+
+/** Brief on-page rectangle so headed debugging shows where the next click targets (bright magenta — not the OS mouse cursor). */
+async function pulseClickArea(page: Page, target: Locator, pulseOpts?: { fast?: boolean }): Promise<void> {
+  const box = await target.boundingBox();
+  if (!box) return;
+  // String body runs in the browser only (server tsconfig has no DOM lib).
+  await page.evaluate(
+    `(() => {
+      const b = ${JSON.stringify(box)};
+      const pad = 2;
+      const el = document.createElement("div");
+      el.setAttribute("data-sniper-click-pulse", "1");
+      const s = el.style;
+      s.position = "fixed";
+      s.left = (b.x - pad) + "px";
+      s.top = (b.y - pad) + "px";
+      s.width = (b.width + pad * 2) + "px";
+      s.height = (b.height + pad * 2) + "px";
+      s.border = "4px solid rgb(255, 0, 160)";
+      s.borderRadius = "8px";
+      s.boxSizing = "border-box";
+      s.pointerEvents = "none";
+      s.zIndex = "2147483647";
+      s.opacity = "1";
+      s.transition = "opacity 0.45s ease-out";
+      s.background = "rgba(255, 0, 160, 0.22)";
+      s.boxShadow = "0 0 0 2px rgba(255, 255, 255, 0.9), 0 0 18px 4px rgba(255, 0, 160, 0.75)";
+      document.body.appendChild(el);
+      setTimeout(function () {
+        s.opacity = "0";
+      }, 220);
+      setTimeout(function () { el.remove(); }, 750);
+    })()`,
+  );
+  const visual = visualClicksEnabled();
+  const ms = visual
+    ? pulseOpts?.fast
+      ? humanDelay(20, 38)
+      : humanDelay(72, 108)
+    : 280;
+  await page.waitForTimeout(ms);
+}
+
+async function clickLoc(
+  page: Page,
+  locator: ReturnType<Page["locator"]>,
+  options?: Parameters<Locator["click"]>[0],
+): Promise<void> {
+  const target = locator.first();
+  if (visualClicksEnabled()) await pulseClickArea(page, target);
+  await target.click(options);
+}
+
 /**
  * Move the mouse to a locator's bounding box with slight randomness,
  * hover briefly (like a real user pausing before clicking), then click.
  */
-async function humanClick(page: Page, locator: ReturnType<Page["locator"]>, opts?: { timeout?: number }): Promise<void> {
-  const box = await locator.first().boundingBox();
+async function humanClick(
+  page: Page,
+  locator: ReturnType<Page["locator"]>,
+  opts?: { timeout?: number; force?: boolean; visualTight?: boolean },
+): Promise<void> {
+  const target = locator.first();
+  const visual = visualClicksEnabled();
+  if (visual) {
+    const tight = opts?.visualTight === true;
+    const box = await target.boundingBox();
+    if (box) {
+      const rx = 0.35 + Math.random() * 0.3;
+      const ry = 0.35 + Math.random() * 0.3;
+      const steps = tight ? 1 + Math.floor(Math.random() * 2) : 3 + Math.floor(Math.random() * 4);
+      await page.mouse.move(box.x + box.width * rx, box.y + box.height * ry, { steps });
+    }
+    await pulseClickArea(page, target, tight ? { fast: true } : undefined);
+    await page.waitForTimeout(tight ? humanDelay(8, 28) : humanDelay(18, 48));
+    await target.click({
+      timeout: opts?.timeout ?? 5000,
+      force: opts?.force === true,
+    });
+    return;
+  }
+  const box = await target.boundingBox();
   if (box) {
     const x = box.x + box.width * (0.3 + Math.random() * 0.4);
     const y = box.y + box.height * (0.3 + Math.random() * 0.4);
     await page.mouse.move(x, y, { steps: 5 + Math.floor(Math.random() * 10) });
     await page.waitForTimeout(humanDelay(50, 150));
   }
-  await locator.first().click({ timeout: opts?.timeout ?? 5000 });
+  await target.click({ timeout: opts?.timeout ?? 5000 });
 }
 
 /**
@@ -1336,7 +1865,9 @@ async function humanType(
   text: string,
   opts?: { clearFirst?: boolean; fast?: boolean },
 ): Promise<void> {
-  await locator.first().click();
+  const field = locator.first();
+  if (visualClicksEnabled()) await pulseClickArea(page, field);
+  await field.click();
   await page.waitForTimeout(opts?.fast ? humanDelay(30, 70) : humanDelay(50, 120));
   if (opts?.clearFirst) {
     const mod = process.platform === "darwin" ? "Meta" : "Control";
@@ -1458,7 +1989,7 @@ async function dismissTrafficModal(
     await saveScreenshot(page, job, `traffic-modal-attempt-${attempt + 1}`);
 
     const refreshBtn = modal.locator('button:has-text("Refresh")');
-    await refreshBtn.click({ timeout: 5000 });
+    await clickLoc(page, refreshBtn, { timeout: 5000 });
     await page.waitForTimeout(800);
   }
 
@@ -1681,7 +2212,7 @@ async function clickStartingAreaFilter(page: Page, job: SniperJob): Promise<void
     return;
   }
 
-  await filterBtn.click({ timeout: 5000 });
+  await clickLoc(page, filterBtn, { timeout: 5000 });
   await page.waitForTimeout(humanDelay(150, 300));
   jobLog(job, `Starting area "${job.startingArea}" filter clicked.`);
   await saveScreenshot(page, job, "starting-area-selected");
@@ -1741,7 +2272,7 @@ async function setGroupSize(page: Page, job: SniperJob): Promise<void> {
     jobLog(job, `Clicking "Add Peoples" button ${clicksNeeded} times...`);
 
     for (let i = 0; i < clicksNeeded; i++) {
-      await plusBtn.first().click({ timeout: 3000 });
+      await clickLoc(page, plusBtn, { timeout: 3000 });
       await page.waitForTimeout(50);
     }
 
@@ -1856,6 +2387,42 @@ async function checkGridAvailabilityForRange(
   }>;
 }
 
+/** Count recreation.gov calendar date buttons — explains missing clicks when the grid is locked. */
+async function logRecAvailabilityButtonStats(page: Page, job: SniperJob): Promise<void> {
+  const stats = await page.evaluate(`(() => {
+    var buttons = Array.from(document.querySelectorAll("button.rec-availability-date"));
+    var enabled = buttons.filter(function (b) { return !b.disabled; });
+    var avail = 0;
+    for (var i = 0; i < enabled.length; i++) {
+      var lab = (enabled[i].getAttribute("aria-label") || "").toLowerCase();
+      if (lab.indexOf("available") !== -1) avail++;
+    }
+    return { total: buttons.length, enabled: enabled.length, withAvailableLabel: avail };
+  })()`);
+  jobLog(
+    job,
+    `rec-availability-date buttons: ${stats.total} total, ${stats.enabled} enabled, ${stats.withAvailableLabel} enabled with "Available" in aria-label.`,
+  );
+  if (stats.total === 0) {
+    jobLog(
+      job,
+      "No calendar date buttons in the DOM — grid may still be loading, session blocked, or markup changed.",
+    );
+  } else if (stats.enabled === 0) {
+    jobLog(
+      job,
+      visualClicksEnabled()
+        ? "All date buttons are disabled — VISUAL_CLICKS mode still targets them (pulses; clicks may fail until the grid unlocks)."
+        : "All date buttons are disabled — the table is not clickable (finish group size / filters, wait for load, booking window, or overlay). Selectors use :not([disabled]), so no cell clicks run.",
+    );
+  } else if (stats.withAvailableLabel === 0) {
+    jobLog(
+      job,
+      'Enabled date buttons exist but none include "Available" in aria-label — labels may differ; cell clicks may still fail to match.',
+    );
+  }
+}
+
 // ---- Browser booking ----
 
 async function attemptBrowserBooking(
@@ -1865,6 +2432,7 @@ async function attemptBrowserBooking(
   creds: { email: string; password: string },
 ): Promise<"booked" | "failed"> {
   try {
+    const visualDev = visualClicksEnabled();
     const facilityId = job.permitId || job.campgroundId;
     const permitUrl = `https://www.recreation.gov/permits/${facilityId}/registration/detailed-availability?date=${targetRange.startDate}&type=overnight`;
 
@@ -1872,17 +2440,21 @@ async function attemptBrowserBooking(
     const reAuthed = await ensureLoggedIn(page, job, creds, { resumeUrl: permitUrl });
     if (reAuthed) {
       jobLog(job, "Re-authenticated. Proceeding with booking from permit page.");
-      await page.waitForTimeout(humanDelay(300, 600));
+      if (!visualDev) {
+        await page.waitForTimeout(humanDelay(300, 600));
+      }
     }
 
     jobLog(job, "Navigating to:", permitUrl);
     await logStepTiming(job, "goto booking page + hydrate", async () => {
       await safeGoto(page, job, permitUrl, "booking-page-loaded-nav");
-      await page.waitForTimeout(humanDelay(150, 350));
+      await page.waitForTimeout(visualDev ? 0 : humanDelay(150, 350));
     });
 
-    await simulateBrowsing(page);
-    await page.waitForTimeout(humanDelay(60, 120));
+    if (!visualDev) {
+      await simulateBrowsing(page);
+      await page.waitForTimeout(humanDelay(60, 120));
+    }
 
     await logStepTiming(job, "set group size (booking)", () =>
       setGroupSize(page, job),
@@ -1894,17 +2466,17 @@ async function attemptBrowserBooking(
       );
     }
 
-    await page.waitForTimeout(humanDelay(150, 300));
+    await page.waitForTimeout(visualDev ? 0 : humanDelay(150, 300));
 
     // Check for "abnormal activity" error before proceeding
-    if (await hasAbnormalActivityError(page)) {
+    if (!visualDev && (await hasAbnormalActivityError(page))) {
       jobLog(job, "Abnormal activity error detected on booking page. Dismissing and retrying...");
       await saveScreenshot(page, job, "abnormal-activity-detected");
       // Try dismissing the error banner
       try {
         const closeBtn = page.locator('.rec-alert-dismiss, button[aria-label="Close"], .alert-close');
         if (await closeBtn.first().isVisible({ timeout: 2000 }).catch(() => false)) {
-          await closeBtn.first().click();
+          await clickLoc(page, closeBtn);
           await page.waitForTimeout(humanDelay(150, 350));
         }
       } catch {
@@ -1924,101 +2496,72 @@ async function attemptBrowserBooking(
       }
     }
 
-    await debugPageState(page, job, "booking-page-loaded");
+    if (!visualDev) {
+      await debugPageState(page, job, "booking-page-loaded");
+    } else {
+      jobLog(job, `[booking-page-loaded] URL: ${page.url()} (VISUAL_CLICKS: skipped full page debug dump)`);
+    }
 
-    const nightDates = expandRange(targetRange);
-    jobLog(job, "Night dates to book:", nightDates);
-
-    // Quick grid check: parse DOM to detect unavailable dates before clicking
-    const gridCheck = await checkGridAvailabilityForRange(
-      page,
-      nightDates,
-      job.trailheadName || null,
-    );
-    if (!gridCheck.allAvailable) {
+    const allNightsInRange = expandRange(targetRange);
+    jobLog(job, "Nights in range [startDate, endDate) for reference:", allNightsInRange);
+    const nightDates = nightsToClickInBrowser(targetRange);
+    if (visualDev) {
       jobLog(
         job,
-        `Grid check: ${gridCheck.unavailableDates.length} date(s) unavailable for ${job.trailheadName || "selected row"}: ${gridCheck.unavailableDates.join(", ")}. Skipping.`,
+        `VISUAL_CLICKS: clicking range boundary date(s) only: ${nightDates.join(" → ")} (not every night in [startDate, endDate)).`,
       );
-      await saveScreenshot(page, job, "grid-dates-unavailable");
-      return "failed";
+    } else {
+      jobLog(job, "Night dates to click in grid:", nightDates);
     }
 
-    let clickCount = 0;
-
-    for (const nightDate of nightDates) {
-      const d = new Date(nightDate + "T00:00:00");
-      const monthName = d.toLocaleString("en-US", { month: "long", timeZone: "UTC" });
-      const dayOfMonth = d.getUTCDate();
-      const year = d.getUTCFullYear();
-      const ariaDateStr = `${monthName} ${dayOfMonth}, ${year}`;
-
-      jobLog(job, `Looking for button with aria-label containing "${ariaDateStr}" and "Available"...`);
-
-      if (clickCount > 0) {
-        await page.waitForTimeout(50);
-      }
-
-      try {
-        let clicked = false;
-
-        // If a specific trailhead is targeted, try its cells first
-        if (job.trailheadName) {
-          const trailBtn = page.locator(
-            `button.rec-availability-date[aria-label*="${job.trailheadName}"][aria-label*="${ariaDateStr}"][aria-label*="Available"]:not([disabled])`,
-          );
-          const trailCount = await trailBtn.count();
-          jobLog(job, `  Trailhead "${job.trailheadName}": found ${trailCount} matching button(s)`);
-          if (trailCount > 0) {
-            await humanClick(page, trailBtn);
-            clickCount++;
-            clicked = true;
-            jobLog(job, `  Trailhead cell clicked! (${clickCount} total)`);
-            await page.waitForTimeout(50);
-          } else {
-            jobLog(job, `  Target trailhead not available for ${nightDate}, falling back to any available...`);
-          }
-        }
-
-        if (!clicked) {
-          const btn = page.locator(
-            `button.rec-availability-date[aria-label*="${ariaDateStr}"][aria-label*="Available"]:not([disabled])`,
-          );
-          const count = await btn.count();
-          jobLog(job, `  Found ${count} matching button(s)`);
-
-          if (count > 0) {
-            await humanClick(page, btn);
-            clickCount++;
-            jobLog(job, `  Clicked! (${clickCount} total)`);
-            await page.waitForTimeout(50);
-          } else {
-            const fallback = page.locator(
-              `button[aria-label*="${ariaDateStr}"]:not([disabled])`,
-            );
-            const fbCount = await fallback.count();
-            jobLog(job, `  Fallback: found ${fbCount} button(s)`);
-            if (fbCount > 0) {
-              await humanClick(page, fallback);
-              clickCount++;
-              jobLog(job, `  Fallback clicked! (${clickCount} total)`);
-              await page.waitForTimeout(50);
-            } else {
-              jobLog(job, `  No available button found for ${nightDate}`);
-            }
-          }
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        jobLog(job, `  Error clicking ${nightDate}: ${msg}`);
+    if (!visualDev) {
+      const gridCheck = await checkGridAvailabilityForRange(
+        page,
+        allNightsInRange,
+        job.trailheadName || null,
+      );
+      if (!gridCheck.allAvailable) {
+        jobLog(
+          job,
+          `Grid check: ${gridCheck.unavailableDates.length} date(s) unavailable for ${job.trailheadName || "selected row"}: ${gridCheck.unavailableDates.join(", ")}. Skipping.`,
+        );
+        await saveScreenshot(page, job, "grid-dates-unavailable");
+        return "failed";
       }
     }
+
+    if (!visualDev) {
+      await logRecAvailabilityButtonStats(page, job);
+    }
+
+    const clickCount = await clickDateCellsForPermitBooking(page, job, nightDates, "");
 
     jobLog(job, `Clicked ${clickCount}/${nightDates.length} date cells`);
 
     if (clickCount === 0) {
       jobLog(job, "No cells clicked - booking failed");
+      if (!visualDev) {
+        await logRecAvailabilityButtonStats(page, job);
+      }
       await saveScreenshot(page, job, "no-cells-clicked");
+      return "failed";
+    }
+
+    if (visualDev && clickCount < nightDates.length) {
+      jobLog(
+        job,
+        `VISUAL_CLICKS: expected ${nightDates.length} cell click(s); got ${clickCount}. Stopping before Book Now.`,
+      );
+      await saveScreenshot(page, job, "visual-incomplete-cell-clicks");
+      return "failed";
+    }
+
+    if (visualDev && clickCount === nightDates.length) {
+      jobLog(
+        job,
+        "VISUAL_CLICKS: start/end (boundary) cells clicked — skipping Book Now so the sniper can try the next desired range or fallback.",
+      );
+      await saveScreenshot(page, job, "visual-after-cells");
       return "failed";
     }
 
@@ -2030,8 +2573,7 @@ async function attemptBrowserBooking(
     });
     void clickDatesMs;
 
-    // Check again for abnormal activity before clicking Book Now
-    if (await hasAbnormalActivityError(page)) {
+    if (!visualDev && (await hasAbnormalActivityError(page))) {
       jobLog(job, "Abnormal activity error appeared after selecting dates.");
       await saveScreenshot(page, job, "abnormal-after-dates");
       return "failed";
@@ -2095,45 +2637,41 @@ async function attemptBrowserBooking(
       const retryUrl = `https://www.recreation.gov/permits/${facilityId2}/registration/detailed-availability?date=${targetRange.startDate}&type=overnight`;
       jobLog(job, "Re-navigating to:", retryUrl);
       await safeGoto(page, job, retryUrl, "retry-booking-nav");
-      await page.waitForTimeout(humanDelay(150, 350));
+      await page.waitForTimeout(visualDev ? 0 : humanDelay(150, 350));
 
       await setGroupSize(page, job);
       if (job.startingArea) {
         await clickStartingAreaFilter(page, job);
       }
-      await page.waitForTimeout(humanDelay(150, 300));
-      await debugPageState(page, job, "retry-booking-page");
-
-      const retryNightDates = expandRange(targetRange);
-      let retryClickCount = 0;
-      for (const nightDate of retryNightDates) {
-        const d = new Date(nightDate + "T00:00:00");
-        const monthName = d.toLocaleString("en-US", { month: "long", timeZone: "UTC" });
-        const dayOfMonth = d.getUTCDate();
-        const year = d.getUTCFullYear();
-        const ariaDateStr = `${monthName} ${dayOfMonth}, ${year}`;
-
-        let selector: string;
-        if (job.trailheadName) {
-          selector = `button.rec-availability-date[aria-label*="${job.trailheadName}"][aria-label*="${ariaDateStr}"][aria-label*="Available"]:not([disabled])`;
-        } else {
-          selector = `button.rec-availability-date[aria-label*="${ariaDateStr}"][aria-label*="Available"]:not([disabled])`;
-        }
-
-        jobLog(job, `[retry] Looking for date cell: ${ariaDateStr}...`);
-        const cells = page.locator(selector);
-        const count = await cells.count();
-        if (count > 0) {
-          await humanClick(page, cells);
-          retryClickCount++;
-          jobLog(job, `  [retry] Clicked! (${retryClickCount} total)`);
-          await page.waitForTimeout(50);
-        }
+      await page.waitForTimeout(visualDev ? 0 : humanDelay(150, 300));
+      if (!visualDev) {
+        await debugPageState(page, job, "retry-booking-page");
       }
+
+      const retryNightDates = nightsToClickInBrowser(targetRange);
+      const retryClickCount = await clickDateCellsForPermitBooking(page, job, retryNightDates, "[retry] ");
 
       if (retryClickCount === 0) {
         jobLog(job, "[retry] No date cells found after re-auth.");
         await saveScreenshot(page, job, "retry-no-dates");
+        return "failed";
+      }
+
+      if (visualDev && retryClickCount < retryNightDates.length) {
+        jobLog(
+          job,
+          `[retry] VISUAL_CLICKS: expected ${retryNightDates.length} cell click(s); got ${retryClickCount}. Stopping before Book Now.`,
+        );
+        await saveScreenshot(page, job, "retry-visual-incomplete-clicks");
+        return "failed";
+      }
+
+      if (visualDev && retryClickCount === retryNightDates.length) {
+        jobLog(
+          job,
+          "[retry] VISUAL_CLICKS: boundary cells clicked — skipping Book Now (try next range/fallback).",
+        );
+        await saveScreenshot(page, job, "retry-visual-after-cells");
         return "failed";
       }
 
@@ -2162,30 +2700,30 @@ async function attemptBrowserBooking(
       if (orderRetry > 0) {
         jobLog(job, `Session expired during order details. Retrying from permit page (attempt ${orderRetry + 1}/${maxOrderDetailsRetries})...`);
         await safeGoto(page, job, permitUrl, "retry-order-details-nav");
-        await page.waitForTimeout(humanDelay(150, 350));
+        await page.waitForTimeout(visualDev ? 0 : humanDelay(150, 350));
         await setGroupSize(page, job);
         if (job.startingArea) await clickStartingAreaFilter(page, job);
-        await page.waitForTimeout(humanDelay(150, 300));
-        const retryNightDates = expandRange(targetRange);
-        let retryClickCount = 0;
-        for (const nightDate of retryNightDates) {
-          const d = new Date(nightDate + "T00:00:00");
-          const monthName = d.toLocaleString("en-US", { month: "long", timeZone: "UTC" });
-          const dayOfMonth = d.getUTCDate();
-          const year = d.getUTCFullYear();
-          const ariaDateStr = `${monthName} ${dayOfMonth}, ${year}`;
-          const selector = job.trailheadName
-            ? `button.rec-availability-date[aria-label*="${job.trailheadName}"][aria-label*="${ariaDateStr}"][aria-label*="Available"]:not([disabled])`
-            : `button.rec-availability-date[aria-label*="${ariaDateStr}"][aria-label*="Available"]:not([disabled])`;
-          const cells = page.locator(selector);
-          if ((await cells.count()) > 0) {
-            await humanClick(page, cells);
-            retryClickCount++;
-            await page.waitForTimeout(50);
-          }
-        }
+        await page.waitForTimeout(visualDev ? 0 : humanDelay(150, 300));
+        const retryNightDates = nightsToClickInBrowser(targetRange);
+        const retryClickCount = await clickDateCellsForPermitBooking(
+          page,
+          job,
+          retryNightDates,
+          "[order retry] ",
+        );
         if (retryClickCount === 0) {
           jobLog(job, "[order retry] No date cells found.");
+          return "failed";
+        }
+        if (visualDev && retryClickCount < retryNightDates.length) {
+          jobLog(
+            job,
+            `[order retry] VISUAL_CLICKS: expected ${retryNightDates.length} cell click(s); got ${retryClickCount}.`,
+          );
+          return "failed";
+        }
+        if (visualDev && retryClickCount === retryNightDates.length) {
+          jobLog(job, "[order retry] VISUAL_CLICKS: boundary cells done — skipping Book Now.");
           return "failed";
         }
         const retryBookBtn = page.locator('button:has-text("Book Now")');
@@ -2424,7 +2962,7 @@ async function attemptCampsiteBooking(
         if (await siteRow.count() > 0) {
           const bookBtn = siteRow.first().locator('button:has-text("Book"), a:has-text("Book")');
           if (await bookBtn.count() > 0) {
-            await bookBtn.first().click({ timeout: 5000 });
+            await clickLoc(page, bookBtn, { timeout: 5000 });
             bookClicked = true;
             jobLog(job, "Clicked Book via data-campsite-id selector");
           }
@@ -2447,10 +2985,10 @@ async function attemptCampsiteBooking(
             const ariaDateStr = `${monthName} ${dayOfMonth}, ${year}`;
 
             const btn = page.locator(
-              `button[aria-label*="${ariaDateStr}"][aria-label*="Available"]:not([disabled])`
+              `button[aria-label*="${ariaDateStr}"][aria-label*="Available"]${dateCellDisabledSelectorClause()}`,
             );
             if (await btn.count() > 0) {
-              await btn.first().click({ timeout: 5000 });
+              await clickLoc(page, btn, { timeout: 5000 });
               clickCount++;
               await page.waitForTimeout(300);
             }
@@ -2463,7 +3001,7 @@ async function attemptCampsiteBooking(
             for (const label of ["Book Now", "Add to Cart", "Reserve", "Continue"]) {
               const btn = page.locator(`button:has-text("${label}")`);
               if (await btn.count() > 0) {
-                await btn.first().click({ timeout: 5000 });
+                await clickLoc(page, btn, { timeout: 5000 });
                 bookClicked = true;
                 jobLog(job, `Clicked "${label}" button`);
                 break;
@@ -2478,12 +3016,15 @@ async function attemptCampsiteBooking(
 
       // Strategy 3: Use page.evaluate to find and click the site row
       if (!bookClicked) {
-        const result = await page.evaluate(`(() => {
+        const campsiteBtnSel = visualClicksEnabled() ? "button" : "button:not([disabled])";
+        const result = await page.evaluate(
+          `(() => {
           const rows = document.querySelectorAll('[class*="campsite-row"], [class*="site-row"], tr[data-component="CampsiteRow"]');
+          const sel = ${JSON.stringify(campsiteBtnSel)};
           for (const row of rows) {
             const text = row.textContent || '';
             if (text.includes('Available')) {
-              const btn = row.querySelector('button:not([disabled])');
+              const btn = row.querySelector(sel);
               if (btn) {
                 btn.click();
                 return 'clicked';
@@ -2491,7 +3032,8 @@ async function attemptCampsiteBooking(
             }
           }
           return 'not-found';
-        })()`);
+        })()`,
+        );
 
         if (result === "clicked") {
           bookClicked = true;
