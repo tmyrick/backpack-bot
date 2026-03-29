@@ -4,6 +4,19 @@ import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 import type { SniperJob, SniperJobRequest, DateRange } from "../types/index.js";
+import {
+  buildRecDateAttempts as buildRecDateAttemptsCore,
+  computeJitteredPollInterval,
+  computePermitAvailabilityQueryWindow,
+  escapeRegExp,
+  expandRange,
+  findFirstFullyAvailableRange,
+  findFirstRangeAcrossPermitDivisions,
+  humanDelayMs,
+  resolveNightsToClickInBrowser,
+  uniqueStringsPreserveOrder,
+  type RecDateAttempt,
+} from "./sniper-logic.js";
 
 export type { SniperJob, SniperJobRequest, DateRange };
 
@@ -37,6 +50,10 @@ const PRE_WARM_LEAD_MS = 2 * 60 * 1000; // 2 minutes before window
 const POST_WINDOW_BEFORE_RELOAD_MS = 2_000;
 const POLL_INTERVAL_MS = 4_000; // 4 seconds base — jittered in practice
 const MAX_WATCH_DURATION_MS = 60 * 1000; // 60 seconds of polling
+/** If still not in-cart after this (from run start): abort and close browser — avoids multi-hour pre-cart runs. */
+const SNIPER_PRE_CART_MAX_RUNTIME_MS = 90 * 60 * 1000;
+/** Hard cap from run start: ends cart keep-alive and closes browser (e.g. 4h total session). */
+const SNIPER_JOB_MAX_RUNTIME_MS = 4 * 60 * 60 * 1000;
 const RECGOV_API = "https://www.recreation.gov/api/permits";
 
 const FIREFOX_UA =
@@ -106,6 +123,93 @@ const jobs = new Map<string, SniperJob>();
 const timers = new Map<string, ReturnType<typeof setTimeout>>();
 const browsers = new Map<string, { browser: Browser; page: Page }>();
 const abortControllers = new Map<string, AbortController>();
+
+/** Pre-cart + hard max timers + optional cart keep-alive stopper. */
+const sniperMaxRuntimeWatchers = new Map<
+  string,
+  {
+    preCartTimer: ReturnType<typeof setTimeout>;
+    maxRuntimeTimer: ReturnType<typeof setTimeout>;
+    stopCartKeepAlive?: () => void;
+  }
+>();
+
+function startSniperMaxRuntimeWatch(job: SniperJob): void {
+  clearSniperMaxRuntimeWatch(job.id);
+  const preCartTimer = setTimeout(() => {
+    void enforceSniperPreCartMaxRuntimeLimit(job.id);
+  }, SNIPER_PRE_CART_MAX_RUNTIME_MS);
+  const maxRuntimeTimer = setTimeout(() => {
+    void enforceSniperMaxRuntimeLimit(job.id);
+  }, SNIPER_JOB_MAX_RUNTIME_MS);
+  sniperMaxRuntimeWatchers.set(job.id, { preCartTimer, maxRuntimeTimer });
+}
+
+function registerCartKeepAliveStopper(jobId: string, stop: () => void): void {
+  const entry = sniperMaxRuntimeWatchers.get(jobId);
+  if (entry) {
+    entry.stopCartKeepAlive = stop;
+  }
+}
+
+function clearSniperMaxRuntimeWatch(jobId: string): void {
+  const entry = sniperMaxRuntimeWatchers.get(jobId);
+  if (!entry) return;
+  clearTimeout(entry.preCartTimer);
+  clearTimeout(entry.maxRuntimeTimer);
+  entry.stopCartKeepAlive?.();
+  sniperMaxRuntimeWatchers.delete(jobId);
+}
+
+/** Abort in-flight work, stop keep-alive, close browser; clears runtime watchers. */
+async function forceSniperRuntimeShutdown(jobId: string): Promise<void> {
+  clearSniperMaxRuntimeWatch(jobId);
+  const ac = abortControllers.get(jobId);
+  if (ac) {
+    ac.abort();
+    abortControllers.delete(jobId);
+  }
+  const b = browsers.get(jobId);
+  if (b) {
+    try {
+      await b.browser.close();
+    } catch {
+      /* ignore */
+    }
+    browsers.delete(jobId);
+  }
+}
+
+/** Fires at SNIPER_PRE_CART_MAX_RUNTIME_MS; no-op if already in-cart (4h limit still applies). */
+async function enforceSniperPreCartMaxRuntimeLimit(jobId: string): Promise<void> {
+  const job = jobs.get(jobId);
+  if (!job || job.status === "in-cart") {
+    return;
+  }
+  await forceSniperRuntimeShutdown(jobId);
+  const j = jobs.get(jobId);
+  if (j && j.status !== "cancelled") {
+    const mins = Math.round(SNIPER_PRE_CART_MAX_RUNTIME_MS / 60_000);
+    updateJob(j, {
+      status: "failed",
+      message: `Stopped after ${mins} min pre-cart limit (never reached cart). Window wait, booking, or polling took too long.`,
+    });
+    await saveJobs();
+  }
+}
+
+async function enforceSniperMaxRuntimeLimit(jobId: string): Promise<void> {
+  await forceSniperRuntimeShutdown(jobId);
+  const job = jobs.get(jobId);
+  if (job && job.status !== "cancelled") {
+    const hours = SNIPER_JOB_MAX_RUNTIME_MS / 3_600_000;
+    updateJob(job, {
+      status: "failed",
+      message: `Stopped after ${hours}h safety limit (browser closed; cart keep-alive ended). If something was in your cart, finish checkout on recreation.gov.`,
+    });
+    await saveJobs();
+  }
+}
 
 // ---- SSE subscribers ----
 
@@ -212,6 +316,8 @@ export async function cancelJob(id: string): Promise<boolean> {
     timers.delete(id);
   }
 
+  clearSniperMaxRuntimeWatch(id);
+
   // Abort running loops
   const ac = abortControllers.get(id);
   if (ac) {
@@ -282,6 +388,13 @@ export async function loadAndScheduleJobs(): Promise<void> {
 }
 
 export async function cleanupAllSniper(): Promise<void> {
+  for (const [, entry] of sniperMaxRuntimeWatchers) {
+    clearTimeout(entry.preCartTimer);
+    clearTimeout(entry.maxRuntimeTimer);
+    entry.stopCartKeepAlive?.();
+  }
+  sniperMaxRuntimeWatchers.clear();
+
   for (const [id] of browsers) {
     const b = browsers.get(id);
     if (b) {
@@ -364,6 +477,7 @@ async function runPermitSniperJob(job: SniperJob): Promise<void> {
   const ac = new AbortController();
   abortControllers.set(job.id, ac);
   const { signal } = ac;
+  startSniperMaxRuntimeWatch(job);
 
   try {
     // ---- Phase 1: Pre-warm ----
@@ -627,6 +741,7 @@ async function runPermitSniperJob(job: SniperJob): Promise<void> {
     abortControllers.delete(job.id);
 
     if (job.status !== "in-cart") {
+      clearSniperMaxRuntimeWatch(job.id);
       const b = browsers.get(job.id);
       if (b) {
         try {
@@ -655,6 +770,7 @@ async function runCampsiteSniperJob(job: SniperJob): Promise<void> {
   const ac = new AbortController();
   abortControllers.set(job.id, ac);
   const { signal } = ac;
+  startSniperMaxRuntimeWatch(job);
 
   try {
     // ---- Phase 1: Pre-warm ----
@@ -982,6 +1098,7 @@ async function runCampsiteSniperJob(job: SniperJob): Promise<void> {
     abortControllers.delete(job.id);
 
     if (job.status !== "in-cart") {
+      clearSniperMaxRuntimeWatch(job.id);
       const b = browsers.get(job.id);
       if (b) {
         try {
@@ -998,47 +1115,12 @@ async function runCampsiteSniperJob(job: SniperJob): Promise<void> {
 // ---- Availability polling (direct API, no browser) ----
 
 /**
- * Expand a DateRange into an array of individual YYYY-MM-DD strings
- * covering every night of the trip (startDate inclusive, endDate exclusive).
- * For a 3-night trip entering July 15 and exiting July 18:
- *   expandRange({ startDate: "2026-07-15", endDate: "2026-07-18" })
- *   => ["2026-07-15", "2026-07-16", "2026-07-17"]
- */
-function expandRange(range: DateRange): string[] {
-  const dates: string[] = [];
-  const current = new Date(range.startDate + "T00:00:00.000Z");
-  const end = new Date(range.endDate + "T00:00:00.000Z");
-  while (current < end) {
-    dates.push(current.toISOString().substring(0, 10));
-    current.setUTCDate(current.getUTCDate() + 1);
-  }
-  return dates;
-}
-
-/**
  * Dates to click in the permit grid. Production: every night in [startDate, endDate).
  * VISUAL_CLICKS: the range's startDate and endDate columns (as the user picked them), not interior nights —
  * e.g. Fri–Sun with endDate Sunday clicks Friday then Sunday, not Saturday.
  */
 function nightsToClickInBrowser(range: DateRange): string[] {
-  if (!visualClicksEnabled()) {
-    return expandRange(range);
-  }
-  if (!range.startDate) {
-    return expandRange(range);
-  }
-  if (!range.endDate || range.startDate >= range.endDate) {
-    return [range.startDate];
-  }
-  return [range.startDate, range.endDate];
-}
-
-/**
- * Format a DateRange for display: "Jul 15 - Jul 18 (3 nights)"
- */
-function formatRange(range: DateRange): string {
-  const nights = expandRange(range).length;
-  return `${range.startDate} to ${range.endDate} (${nights} night${nights !== 1 ? "s" : ""})`;
+  return resolveNightsToClickInBrowser(range, visualClicksEnabled());
 }
 
 async function checkAvailability(
@@ -1046,15 +1128,8 @@ async function checkAvailability(
   divisionId: string,
   ranges: DateRange[],
 ): Promise<DateRange | null> {
-  // Compute the widest date window covering all desired ranges
-  const allStartDates = ranges.map((r) => r.startDate).sort();
-  const allEndDates = ranges.map((r) => r.endDate).sort();
-  const queryStart = new Date(allStartDates[0] + "T00:00:00.000Z");
-  const queryEnd = new Date(allEndDates[allEndDates.length - 1] + "T00:00:00.000Z");
-  // Extend end by 1 day for the API
-  queryEnd.setUTCDate(queryEnd.getUTCDate() + 1);
-
-  const url = `${RECGOV_API}/${permitId}/availability?start_date=${queryStart.toISOString()}&end_date=${queryEnd.toISOString()}&commercial_acct=false`;
+  const { queryStartIso, queryEndIso } = computePermitAvailabilityQueryWindow(ranges);
+  const url = `${RECGOV_API}/${permitId}/availability?start_date=${queryStartIso}&end_date=${queryEndIso}&commercial_acct=false`;
 
   const res = await fetch(url, {
     headers: {
@@ -1084,22 +1159,12 @@ async function checkAvailability(
   const division = data.payload.availability[divisionId];
   if (!division) return null;
 
-  // Build a lookup of date -> remaining
   const availByDate = new Map<string, number>();
   for (const [isoDate, avail] of Object.entries(division.date_availability)) {
     availByDate.set(isoDate.substring(0, 10), avail.remaining);
   }
 
-  // Check ranges in priority order -- ALL dates in the range must have remaining > 0
-  for (const range of ranges) {
-    const nights = expandRange(range);
-    const allAvailable = nights.every((d) => (availByDate.get(d) ?? 0) > 0);
-    if (allAvailable) {
-      return range;
-    }
-  }
-
-  return null;
+  return findFirstFullyAvailableRange(ranges, availByDate);
 }
 
 /**
@@ -1110,13 +1175,8 @@ async function checkPermitFacilityAvailability(
   permitId: string,
   ranges: DateRange[],
 ): Promise<DateRange | null> {
-  const allStartDates = ranges.map((r) => r.startDate).sort();
-  const allEndDates = ranges.map((r) => r.endDate).sort();
-  const queryStart = new Date(allStartDates[0] + "T00:00:00.000Z");
-  const queryEnd = new Date(allEndDates[allEndDates.length - 1] + "T00:00:00.000Z");
-  queryEnd.setUTCDate(queryEnd.getUTCDate() + 1);
-
-  const url = `${RECGOV_API}/${permitId}/availability?start_date=${queryStart.toISOString()}&end_date=${queryEnd.toISOString()}&commercial_acct=false`;
+  const { queryStartIso, queryEndIso } = computePermitAvailabilityQueryWindow(ranges);
+  const url = `${RECGOV_API}/${permitId}/availability?start_date=${queryStartIso}&end_date=${queryEndIso}&commercial_acct=false`;
 
   const res = await fetch(url, {
     headers: {
@@ -1143,23 +1203,7 @@ async function checkPermitFacilityAvailability(
     };
   };
 
-  // Check ALL divisions -- find the first one where a desired range is fully available
-  for (const [, division] of Object.entries(data.payload.availability)) {
-    const availByDate = new Map<string, number>();
-    for (const [isoDate, avail] of Object.entries(division.date_availability)) {
-      availByDate.set(isoDate.substring(0, 10), avail.remaining);
-    }
-
-    for (const range of ranges) {
-      const nights = expandRange(range);
-      const allAvailable = nights.every((d) => (availByDate.get(d) ?? 0) > 0);
-      if (allAvailable) {
-        return range;
-      }
-    }
-  }
-
-  return null;
+  return findFirstRangeAcrossPermitDivisions(ranges, data.payload.availability);
 }
 
 // ---- Campsite availability polling (direct API, no browser) ----
@@ -1248,6 +1292,9 @@ async function checkCampsiteAvailability(
   // Check ranges in priority order
   for (const range of ranges) {
     const nights = expandRange(range);
+    if (nights.length === 0) {
+      continue;
+    }
 
     for (const [csId, cs] of candidates) {
       if (!cs) continue;
@@ -1412,13 +1459,12 @@ async function hasAbnormalActivityError(page: Page): Promise<boolean> {
  * Random delay between min and max ms to mimic human behavior.
  */
 function humanDelay(min = 150, max = 400): number {
-  return Math.floor(Math.random() * (max - min)) + min;
+  return humanDelayMs(min, max, Math.random);
 }
 
 /** Return a jittered poll interval (±30% around POLL_INTERVAL_MS). */
 function jitteredPollInterval(): number {
-  const jitter = POLL_INTERVAL_MS * 0.3;
-  return Math.floor(POLL_INTERVAL_MS + (Math.random() * 2 - 1) * jitter);
+  return computeJitteredPollInterval(POLL_INTERVAL_MS, Math.random);
 }
 
 function visualClicksEnabled(): boolean {
@@ -1432,22 +1478,11 @@ function dateCellDisabledSelectorClause(): string {
   return visualClicksEnabled() ? "" : ":not([disabled])";
 }
 
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function recAvailabilityButtonLocator(page: Page): ReturnType<Page["locator"]> {
   return visualClicksEnabled()
     ? page.locator("button.rec-availability-date")
     : page.locator("button.rec-availability-date:not([disabled])");
 }
-
-type RecDateAttempt = {
-  trail: string | null;
-  requireAvailableInName: boolean;
-  recClassOnly: boolean;
-  label: string;
-};
 
 /**
  * Production: recreation.gov uses `{Trail} on March 20, 2026 - Available|Unavailable`. Matching `(?=.*Available)`
@@ -1456,50 +1491,7 @@ type RecDateAttempt = {
  * VISUAL_CLICKS: only trail + date or date alone — ignore - Available / - Unavailable for headed debugging.
  */
 function buildRecDateAttempts(job: SniperJob, rowTrailOverride?: string): RecDateAttempt[] {
-  const attempts: RecDateAttempt[] = [];
-  const th =
-    rowTrailOverride !== undefined ? rowTrailOverride.trim() || undefined : job.trailheadName?.trim();
-
-  if (visualClicksEnabled()) {
-    if (th) {
-      attempts.push({
-        trail: th,
-        requireAvailableInName: false,
-        recClassOnly: true,
-        label: `VISUAL: trailhead "${th}" + date (ignores - Available / - Unavailable; no other-row fallback)`,
-      });
-    } else {
-      attempts.push({
-        trail: null,
-        requireAvailableInName: false,
-        recClassOnly: true,
-        label: "VISUAL: first .rec-availability-date for this date (Olympic filter only; no generic-button fallback)",
-      });
-    }
-    return attempts;
-  }
-
-  if (th) {
-    attempts.push({
-      trail: th,
-      requireAvailableInName: true,
-      recClassOnly: true,
-      label: `trailhead "${th}" + date + " - Available"`,
-    });
-  }
-  attempts.push({
-    trail: null,
-    requireAvailableInName: true,
-    recClassOnly: true,
-    label: th ? 'any row: date + " - Available"' : 'first row: date + " - Available"',
-  });
-  attempts.push({
-    trail: null,
-    requireAvailableInName: false,
-    recClassOnly: false,
-    label: "fallback: any enabled button whose name contains the date",
-  });
-  return attempts;
+  return buildRecDateAttemptsCore(job, visualClicksEnabled(), rowTrailOverride);
 }
 
 function locatorForRecDateAttempt(page: Page, ariaDateStr: string, attempt: RecDateAttempt): Locator {
@@ -1590,17 +1582,6 @@ async function visualExpandOlympicToAllRows(page: Page, job: SniperJob): Promise
     'VISUAL: no All / All areas Olympic filter found — only rows visible under the current starting area will be walked.',
   );
   return false;
-}
-
-function uniqueStringsPreserveOrder(values: string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const v of values) {
-    if (seen.has(v)) continue;
-    seen.add(v);
-    out.push(v);
-  }
-  return out;
 }
 
 async function clickDateCellsForPermitBookingOneRow(
@@ -2125,6 +2106,12 @@ function startCartKeepAliveWatcher(
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
 
+  const stop = () => {
+    stopped = true;
+    if (timeoutId) clearTimeout(timeoutId);
+  };
+  registerCartKeepAliveStopper(job.id, stop);
+
   const scheduleNext = () => {
     if (stopped) return;
     const delayMs = humanDelay(CART_KEEPALIVE_INTERVAL_MIN_MS, CART_KEEPALIVE_INTERVAL_MAX_MS);
@@ -2140,12 +2127,13 @@ function startCartKeepAliveWatcher(
     }, delayMs);
   };
 
+  jobLog(
+    job,
+    `Cart keep-alive: ~5–9 min cycles until ${SNIPER_JOB_MAX_RUNTIME_MS / 3_600_000}h total run limit (pre-cart jobs stop after ${Math.round(SNIPER_PRE_CART_MAX_RUNTIME_MS / 60_000)} min if not in cart).`,
+  );
   scheduleNext();
 
-  return () => {
-    stopped = true;
-    if (timeoutId) clearTimeout(timeoutId);
-  };
+  return stop;
 }
 
 /**
@@ -2860,7 +2848,10 @@ async function fillOrderDetails(page: Page, job: SniperJob): Promise<boolean | "
     await saveScreenshot(page, job, "after-proceed-to-cart");
 
     if (page.url().includes("/cart")) {
-      jobLog(job, "On cart page. Starting cart keep-alive watcher (Modify -> Order Details -> Proceed to Cart every 5-9 min).");
+      jobLog(
+        job,
+        "On cart page. Starting cart keep-alive (Modify → Order Details → Proceed to Cart on a jittered ~5–9 min schedule).",
+      );
       startCartKeepAliveWatcher(page, job);
     }
 
