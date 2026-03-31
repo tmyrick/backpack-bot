@@ -1987,12 +1987,56 @@ async function dismissTrafficModal(
   return true;
 }
 
+/**
+ * Blocks pointer events on the cart (e.g. after re-auth) until dismissed.
+ * Heading text from site: "Your cart is about to expire."
+ */
+async function dismissCartExpiryWarningModal(page: Page, job: SniperJob): Promise<boolean> {
+  const heading = page.locator("#modal-heading").filter({ hasText: /about to expire/i });
+  const visible = await heading.isVisible({ timeout: 1200 }).catch(() => false);
+  if (!visible) return false;
+
+  jobLog(job, "Cart expiry warning modal detected. Dismissing...");
+  await saveScreenshot(page, job, "cart-expiry-modal");
+
+  const portal = page.locator(".ReactModalPortal").filter({ has: heading });
+  const buttonSelectors = [
+    "button.sarsa-button-primary",
+    'button:has-text("Continue")',
+    'button:has-text("OK")',
+    'button:has-text("Got it")',
+    'button[aria-label="Close"]',
+  ];
+  for (const sel of buttonSelectors) {
+    const btn = portal.locator(sel).first();
+    try {
+      if (await btn.isVisible({ timeout: 600 }).catch(() => false)) {
+        await clickLoc(page, btn, { timeout: 8000 });
+        await page.waitForTimeout(humanDelay(400, 900));
+        if (!(await heading.isVisible().catch(() => false))) return true;
+      }
+    } catch {
+      /* try next selector */
+    }
+  }
+
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(humanDelay(300, 600));
+  return !(await heading.isVisible().catch(() => false));
+}
+
+async function dismissBlockingCartModals(page: Page, job: SniperJob): Promise<void> {
+  await dismissTrafficModal(page, job);
+  await dismissCartExpiryWarningModal(page, job);
+}
+
 // ---- Cart keep-alive (Modify -> Order Details -> Proceed to Cart resets timer) ----
 
 const CART_KEEPALIVE_INTERVAL_MIN_MS = 5 * 60 * 1000; // 5 minutes
 const CART_KEEPALIVE_INTERVAL_MAX_MS = 9 * 60 * 1000; // 9 minutes
 const CART_KEEPALIVE_WAIT_ON_ORDER_DETAILS_MIN_MS = 10 * 1000; // 10 seconds
 const CART_KEEPALIVE_WAIT_ON_ORDER_DETAILS_MAX_MS = 30 * 1000; // 30 seconds
+const CART_KEEPALIVE_ORDER_DETAILS_BTN_TIMEOUT_MS = 30 * 1000;
 
 /**
  * Perform one keep-alive cycle: click Modify on cart -> Order Details -> wait -> Proceed to Cart.
@@ -2040,53 +2084,96 @@ async function runCartKeepAliveCycle(
       return false;
     }
 
+    await dismissBlockingCartModals(page, job);
+
     const modifyBtn = page.locator(
       'button[aria-label="Edit Reservation"], button.rec-button-link[title="Edit Reservation"]',
     );
-    const isVisible = await modifyBtn.first().isVisible({ timeout: 3000 }).catch(() => false);
-    if (!isVisible) {
-      jobLog(job, "Cart keep-alive: Modify button not found, skipping.");
-      return false;
-    }
 
-    jobLog(job, "Cart keep-alive: clicking Modify to reset timer...");
-    await humanClick(page, modifyBtn.first());
-    await page.waitForTimeout(1000);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await dismissBlockingCartModals(page, job);
 
-    const orderDetailsBtn = page.locator('button[data-testid="OrderDetailsSummary-cart-btn"]');
-    await orderDetailsBtn.waitFor({ state: "visible", timeout: 15000 });
-    jobLog(job, "Cart keep-alive: on Order Details page.");
+      const isModifyVisible = await modifyBtn.first().isVisible({ timeout: 3000 }).catch(() => false);
+      if (!isModifyVisible) {
+        if (attempt === 1) {
+          jobLog(job, "Cart keep-alive: Modify button not found, skipping.");
+          return false;
+        }
+        try {
+          await safeGoto(page, job, CART_URL, "cart-keepalive-await-modify");
+          await page.waitForTimeout(humanDelay(500, 1200));
+        } catch {
+          /* ignore */
+        }
+        continue;
+      }
 
-    const waitMs = humanDelay(
-      CART_KEEPALIVE_WAIT_ON_ORDER_DETAILS_MIN_MS,
-      CART_KEEPALIVE_WAIT_ON_ORDER_DETAILS_MAX_MS,
-    );
-    jobLog(job, `Cart keep-alive: waiting ${Math.round(waitMs / 1000)}s (with mouse/scroll) before Proceed to Cart...`);
-    const waitStart = Date.now();
-    await simulateBrowsing(page);
-    await page.waitForTimeout(humanDelay(2000, 5000));
-    await simulateBrowsing(page);
-    const elapsed = Date.now() - waitStart;
-    await page.waitForTimeout(Math.max(0, waitMs - elapsed));
-
-    await humanClick(page, orderDetailsBtn);
-    await page.waitForTimeout(1500);
-
-    let backOnCart = page.url().includes("/cart");
-    if (backOnCart) {
-      jobLog(job, "Cart keep-alive: back on cart. Timer reset.");
-      await saveScreenshot(page, job, "cart-keepalive-done");
-    } else {
-      jobLog(job, "Cart keep-alive: may not have returned to cart. URL:", page.url());
-      jobLog(job, "Cart keep-alive: navigating back to cart...");
       try {
-        await safeGoto(page, job, CART_URL, "cart-keepalive-recovery");
-        backOnCart = page.url().includes("/cart");
-      } catch {
-        /* ignore */
+        jobLog(job, "Cart keep-alive: clicking Modify to reset timer...");
+        await humanClick(page, modifyBtn.first());
+        await page.waitForTimeout(1000);
+
+        await dismissBlockingCartModals(page, job);
+
+        const orderDetailsBtn = page.locator('button[data-testid="OrderDetailsSummary-cart-btn"]');
+        await orderDetailsBtn.waitFor({
+          state: "visible",
+          timeout: CART_KEEPALIVE_ORDER_DETAILS_BTN_TIMEOUT_MS,
+        });
+        jobLog(job, "Cart keep-alive: on Order Details page.");
+
+        const waitMs = humanDelay(
+          CART_KEEPALIVE_WAIT_ON_ORDER_DETAILS_MIN_MS,
+          CART_KEEPALIVE_WAIT_ON_ORDER_DETAILS_MAX_MS,
+        );
+        jobLog(
+          job,
+          `Cart keep-alive: waiting ${Math.round(waitMs / 1000)}s (with mouse/scroll) before Proceed to Cart...`,
+        );
+        const waitStart = Date.now();
+        await simulateBrowsing(page);
+        await page.waitForTimeout(humanDelay(2000, 5000));
+        await simulateBrowsing(page);
+        const elapsed = Date.now() - waitStart;
+        await page.waitForTimeout(Math.max(0, waitMs - elapsed));
+
+        await dismissBlockingCartModals(page, job);
+        await humanClick(page, orderDetailsBtn);
+        await page.waitForTimeout(1500);
+
+        let backOnCart = page.url().includes("/cart");
+        if (backOnCart) {
+          jobLog(job, "Cart keep-alive: back on cart. Timer reset.");
+          await saveScreenshot(page, job, "cart-keepalive-done");
+        } else {
+          jobLog(job, "Cart keep-alive: may not have returned to cart. URL:", page.url());
+          jobLog(job, "Cart keep-alive: navigating back to cart...");
+          try {
+            await safeGoto(page, job, CART_URL, "cart-keepalive-recovery");
+            backOnCart = page.url().includes("/cart");
+          } catch {
+            /* ignore */
+          }
+        }
+        return backOnCart;
+      } catch (innerErr) {
+        const innerMsg = innerErr instanceof Error ? innerErr.message : String(innerErr);
+        if (attempt === 0) {
+          jobLog(job, "Cart keep-alive: attempt failed, recovering:", innerMsg);
+          await dismissBlockingCartModals(page, job);
+          try {
+            await safeGoto(page, job, CART_URL, "cart-keepalive-retry");
+            await page.waitForTimeout(humanDelay(800, 1600));
+          } catch {
+            /* ignore */
+          }
+          continue;
+        }
+        throw innerErr;
       }
     }
-    return backOnCart;
+
+    return false;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     jobLog(job, "Cart keep-alive error:", msg);
