@@ -55,6 +55,8 @@ const SNIPER_PRE_CART_MAX_RUNTIME_MS = 90 * 60 * 1000;
 /** Hard cap from run start: ends cart keep-alive and closes browser (e.g. 4h total session). */
 const SNIPER_JOB_MAX_RUNTIME_MS = 4 * 60 * 60 * 1000;
 const RECGOV_API = "https://www.recreation.gov/api/permits";
+/** Node's setTimeout delay is a signed 32-bit int; larger values overflow and fire immediately. */
+const MAX_TIMEOUT_MS = 2_147_483_647; // ~24.8 days
 
 const FIREFOX_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0";
@@ -120,9 +122,38 @@ async function launchStealthBrowser(): Promise<{ browser: Browser; context: Brow
 // ---- In-memory state ----
 
 const jobs = new Map<string, SniperJob>();
-const timers = new Map<string, ReturnType<typeof setTimeout>>();
+const timers = new Map<string, LongTimeout>();
 const browsers = new Map<string, { browser: Browser; page: Page }>();
 const abortControllers = new Map<string, AbortController>();
+
+type LongTimeout = { cancel: () => void };
+
+/**
+ * setTimeout replacement that supports delays beyond Node's ~24.8 day limit.
+ * Long delays are chained in <= MAX_TIMEOUT_MS chunks so the callback fires at
+ * the right time instead of overflowing the 32-bit delay and firing immediately.
+ */
+function setLongTimeout(fn: () => void, ms: number): LongTimeout {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let remaining = Math.max(0, ms);
+  const arm = (): void => {
+    const chunk = Math.min(remaining, MAX_TIMEOUT_MS);
+    remaining -= chunk;
+    timer = setTimeout(() => {
+      if (remaining > 0) {
+        arm();
+      } else {
+        fn();
+      }
+    }, chunk);
+  };
+  arm();
+  return {
+    cancel: () => {
+      if (timer) clearTimeout(timer);
+    },
+  };
+}
 
 /** Pre-cart + hard max timers + optional cart keep-alive stopper. */
 const sniperMaxRuntimeWatchers = new Map<
@@ -312,7 +343,7 @@ export async function cancelJob(id: string): Promise<boolean> {
   // Clear timers
   const timer = timers.get(id);
   if (timer) {
-    clearTimeout(timer);
+    timer.cancel();
     timers.delete(id);
   }
 
@@ -408,7 +439,7 @@ export async function cleanupAllSniper(): Promise<void> {
   browsers.clear();
 
   for (const [, timer] of timers) {
-    clearTimeout(timer);
+    timer.cancel();
   }
   timers.clear();
 
@@ -425,7 +456,7 @@ export async function cleanupAllSniper(): Promise<void> {
 function scheduleJob(job: SniperJob): void {
   // Clear any existing timer for this job
   const existing = timers.get(job.id);
-  if (existing) clearTimeout(existing);
+  if (existing) existing.cancel();
 
   const windowTime = new Date(job.windowOpensAt).getTime();
   const preWarmTime = windowTime - PRE_WARM_LEAD_MS;
@@ -435,7 +466,7 @@ function scheduleJob(job: SniperJob): void {
     console.log(
       `[sniper:${job.id.slice(0, 8)}] Pre-warm in ${Math.round(delayToPreWarm / 1000)}s, window in ${Math.round((windowTime - Date.now()) / 1000)}s`,
     );
-    const timer = setTimeout(() => {
+    const timer = setLongTimeout(() => {
       timers.delete(job.id);
       runSniperJob(job);
     }, delayToPreWarm);
@@ -3377,11 +3408,11 @@ async function signInAttempt(
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
+    const timer = setLongTimeout(resolve, ms);
     signal?.addEventListener(
       "abort",
       () => {
-        clearTimeout(timer);
+        timer.cancel();
         reject(new Error("Aborted"));
       },
       { once: true },
